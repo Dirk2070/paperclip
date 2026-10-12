@@ -185,12 +185,18 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(await db.select().from(executionWorkspaceRepositoryAccess).where(eq(executionWorkspaceRepositoryAccess.companyId, f.companyId))).toEqual(beforeRead);
   });
 
-  it("preserves legacy private publishers before moving their workspace away from shared files", async () => {
+  it.each(["update", "archive"] as const)("preserves legacy private publishers before %s moves their workspace away from shared files", async operation => {
     const f = await fixture(), peer = await standardPeer(f);
     const repository = { kind: "url" as const, url: "https://github.com/public/legacy-shared" };
     await f.service.request({ companyId: f.companyId, issueId: peer.issueId, actor: peer.actor,
       request: { repository, requestKey: randomUUID() } });
     await privateTask(f);
+    const [project] = await db.insert(projects).values({ companyId: f.companyId, name: "Private legacy source", visibility: "private" }).returning();
+    await db.insert(projectAccessMembers).values([
+      { companyId: f.companyId, projectId: project.id, subjectType: "agent", subjectId: f.agentId },
+      { companyId: f.companyId, projectId: project.id, subjectType: "user", subjectId: f.userId },
+    ]);
+    await db.update(executionWorkspaces).set({ projectId: project.id, sourceIssueId: f.issueId }).where(eq(executionWorkspaces.id, f.workspace.id));
     await f.request(repository);
     await localPrivateClone(f);
     const [checkout] = await f.service.prepareForAdmission(f.admission);
@@ -200,12 +206,24 @@ const support = await getEmbeddedPostgresTestSupport();
     await db.delete(executionWorkspaceRepositoryAccess).where(eq(executionWorkspaceRepositoryAccess.companyId, f.companyId));
     const moved = path.join(root, `${f.issueId}-legacy-moved`);
     await mkdir(moved);
-    await executionWorkspaceService(db).update(f.workspace.id, { cwd: moved });
+    const patch = { cwd: moved, projectId: null, sourceIssueId: null, metadata: {} };
+    const svc = executionWorkspaceService(db);
+    if (operation === "archive") {
+      const result = await svc.archiveWorkspaceUnderLifecycleLock({ id: f.workspace.id, patch, closedAt: new Date() });
+      expect(result?.outcome).toBe("archived");
+      if (result?.outcome === "archived") {
+        expect(result.capturedGeneration).toBeGreaterThan(0);
+        expect(result.workspace.status).toBe("archived");
+        expect(result.workspace.metadata?._issuePrivacySources).toHaveProperty(f.issueId);
+      }
+    } else await svc.update(f.workspace.id, patch);
+    await db.update(issues).set({ executionWorkspaceId: null }).where(eq(issues.id, f.issueId));
     await expect(assertExecutionWorkspaceRootReadAccess(db, { companyId: f.companyId, cwd: peer.admission.cwd,
-      sourceWorkspaceId: peer.workspace.id, actor: peer.actor })).rejects.toThrow(/workspace access|authorization boundary/);
-    await expect(f.service.prepareForAdmission(peer.admission)).rejects.toThrow(/workspace access|authorization boundary/);
+      sourceWorkspaceId: peer.workspace.id, actor: peer.actor })).rejects.toThrow(/workspace access|authorization boundary|source project/);
+    await expect(f.service.prepareForAdmission(peer.admission)).rejects.toThrow(/workspace access|authorization boundary|source project/);
     const retained = await db.select().from(executionWorkspaceRepositoryAccess).where(eq(executionWorkspaceRepositoryAccess.companyId, f.companyId));
     expect(retained.some(entry => entry.kind === "source" && entry.scopeId === f.workspace.id)).toBe(true);
+    expect(retained.some(entry => entry.kind === "project_source" && entry.scopeId === project.id)).toBe(true);
     expect(retained.some(entry => entry.kind === "repository" || entry.kind === "reader")).toBe(false);
     expect(await readFile(path.join(checkout.cwd, "private.txt"), "utf8")).toBe("Private task edits\n");
   });

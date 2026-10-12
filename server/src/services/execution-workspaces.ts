@@ -234,6 +234,34 @@ async function acquireExecutionWorkspaceLifecycleLock(
   );
 }
 
+const workspaceSourceKeys = ["cwd", "projectId", "projectWorkspaceId", "sourceIssueId"] as const;
+
+/** Caller holds the company root fence and the current workspace row lock. */
+async function preserveWorkspaceOwnershipForPatch(
+  tx: DbTransaction, current: typeof executionWorkspaces.$inferSelect, patch: Partial<typeof executionWorkspaces.$inferInsert>,
+) {
+  if (workspaceSourceKeys.some(key => patch[key] !== undefined && patch[key] !== current[key])) {
+    await preserveExecutionWorkspaceRootProvenance(tx, {
+      companyId: current.companyId, workspaceId: current.id, cwd: current.cwd,
+    });
+  }
+  const nextPatch = { ...patch };
+  const retainedSources = {
+    ...parseObject(parseObject(patch.metadata)._issuePrivacySources),
+    ...parseObject(current.metadata?._issuePrivacySources),
+  };
+  if (patch.sourceIssueId !== undefined && patch.sourceIssueId !== current.sourceIssueId && current.sourceIssueId) {
+    retainedSources[current.sourceIssueId] = true;
+  }
+  if (Object.keys(retainedSources).length > 0) {
+    nextPatch.metadata = {
+      ...(patch.metadata !== undefined ? patch.metadata ?? {} : current.metadata ?? {}),
+      _issuePrivacySources: retainedSources,
+    };
+  }
+  return nextPatch;
+}
+
 export type ReopenClosedIsolatedExecutionWorkspaceResult =
   // `generation` is the lifecycle generation the reopen published the active row
   // at. It owns the reopen-pending flag. A later clear must present this same
@@ -3189,8 +3217,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
     },
 
     update: async (id: string, patch: Partial<typeof executionWorkspaces.$inferInsert>) => {
-      const sourceKeys = ["cwd", "projectId", "projectWorkspaceId", "sourceIssueId"] as const;
-      if (patch.metadata === undefined && !sourceKeys.some(key => patch[key] !== undefined)) {
+      if (patch.metadata === undefined && !workspaceSourceKeys.some(key => patch[key] !== undefined)) {
         const row = await db.update(executionWorkspaces).set({ ...patch, updatedAt: new Date() })
           .where(eq(executionWorkspaces.id, id)).returning().then(rows => rows[0] ?? null);
         return row ? toExecutionWorkspace(row) : null;
@@ -3206,25 +3233,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
           eq(executionWorkspaces.id, id), eq(executionWorkspaces.companyId, identity.companyId),
         )).for("no key update");
         if (!current) return null;
-        if (sourceKeys.some(key => patch[key] !== undefined && patch[key] !== current[key])) {
-          await preserveExecutionWorkspaceRootProvenance(tx, {
-            companyId: current.companyId, workspaceId: current.id, cwd: current.cwd,
-          });
-        }
-        const nextPatch = { ...patch };
-        const retainedSources = {
-          ...parseObject(parseObject(patch.metadata)._issuePrivacySources),
-          ...parseObject(current.metadata?._issuePrivacySources),
-        };
-        if (patch.sourceIssueId !== undefined && patch.sourceIssueId !== current.sourceIssueId && current.sourceIssueId) {
-          retainedSources[current.sourceIssueId] = true;
-        }
-        if (Object.keys(retainedSources).length > 0) {
-          nextPatch.metadata = {
-            ...(patch.metadata !== undefined ? patch.metadata ?? {} : current.metadata ?? {}),
-            _issuePrivacySources: retainedSources,
-          };
-        }
+        const nextPatch = await preserveWorkspaceOwnershipForPatch(tx, current, patch);
         const [row] = await tx.update(executionWorkspaces).set({ ...nextPatch, updatedAt: new Date() })
           .where(and(eq(executionWorkspaces.id, id), eq(executionWorkspaces.companyId, current.companyId))).returning();
         return row ? toExecutionWorkspace(row) : null;
@@ -3588,12 +3597,17 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
       | { outcome: "reopen_pending" }
       | null
     > => {
+      const [identity] = await db.select({ companyId: executionWorkspaces.companyId }).from(executionWorkspaces)
+        .where(eq(executionWorkspaces.id, input.id));
+      if (!identity) return null;
       return db.transaction(async (tx) => {
+        await lockExecutionWorkspaceRootProvenance(tx, identity.companyId);
         await acquireExecutionWorkspaceLifecycleLock(tx, input.id);
         const fresh = await tx
           .select()
           .from(executionWorkspaces)
-          .where(eq(executionWorkspaces.id, input.id))
+          .where(and(eq(executionWorkspaces.id, input.id), eq(executionWorkspaces.companyId, identity.companyId)))
+          .for("no key update")
           .then((rows) => rows[0] ?? null);
         if (!fresh || isClosedExecutionWorkspaceStatus(fresh.status)) {
           // The row is missing or already closed by a concurrent path. Do not
@@ -3607,8 +3621,9 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
           // rebuilt worktree. The route maps this to HTTP 409.
           return { outcome: "reopen_pending" };
         }
+        const nextPatch = await preserveWorkspaceOwnershipForPatch(tx, fresh, input.patch);
         const baseMetadata =
-          (input.patch.metadata as Record<string, unknown> | null | undefined)
+          (nextPatch.metadata as Record<string, unknown> | null | undefined)
           ?? (fresh.metadata as Record<string, unknown> | null);
         const archiveMetadata = clearMetadataReopenPendingConsumption(
           bumpExecutionWorkspaceLifecycleGeneration(baseMetadata),
@@ -3616,7 +3631,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
         const archived = await tx
           .update(executionWorkspaces)
           .set({
-            ...input.patch,
+            ...nextPatch,
             status: "archived",
             closedAt: input.closedAt,
             cleanupReason: null,
@@ -3625,6 +3640,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
           })
           .where(and(
             eq(executionWorkspaces.id, input.id),
+            eq(executionWorkspaces.companyId, fresh.companyId),
             // Defense in depth: never archive a reopen-pending row even if the
             // flag appears between the read above and this write. The lifecycle
             // lock already serializes reopen and archive, so this predicate only
