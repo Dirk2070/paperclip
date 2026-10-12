@@ -1,329 +1,130 @@
 name: Release Smoke
-
+run-name: ARM installed startup diagnosis dcdf09a with tools 695506ad
 on:
   workflow_dispatch:
-    inputs:
-      paperclip_version:
-        description: Published Paperclip dist-tag to test
-        required: true
-        default: canary
-        type: choice
-        options:
-          - canary
-          - nightly
-          - beta
-          - latest
-      host_port:
-        description: Host port for the Docker smoke container
-        required: false
-        default: "3232"
-        type: string
-      artifact_name:
-        description: Artifact name for uploaded diagnostics
-        required: false
-        default: release-smoke
-        type: string
-      qualification_source_sha:
-        description: Optional immutable source SHA for provider-free native package qualification
-        required: false
-        default: ""
-        type: string
-  workflow_call:
-    inputs:
-      paperclip_version:
-        required: true
-        type: string
-      host_port:
-        required: false
-        default: "3232"
-        type: string
-      artifact_name:
-        required: false
-        default: release-smoke
-        type: string
-      qualification_source_sha:
-        required: false
-        default: ""
-        type: string
-
 permissions:
   contents: read
-
+  actions: read
 jobs:
-  # The Docker smoke below can never exercise the background-service leg of
-  # onboarding: containers have no service manager, so v2026.824.0 shipped a
-  # service install that crash-looped on a missing shim while every
-  # golden-path check stayed green. Run the same published artifact directly
-  # on the runner VM's systemd and require the installed service to end up
-  # serving.
-  smoke_service:
-    if: inputs.qualification_source_sha == ''
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v7
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v7
-        with:
-          node-version: 24
-
-      - name: Start a user systemd session
-        # The hosted runner has no login session for the runner user, so
-        # `systemctl --user` cannot reach a user manager until lingering
-        # starts one. Export the session address for the steps below.
-        run: |
-          sudo loginctl enable-linger "$(id -un)"
-          uid="$(id -u)"
-          for _ in $(seq 1 30); do
-            [[ -S "/run/user/$uid/bus" ]] && break
-            sleep 1
-          done
-          [[ -S "/run/user/$uid/bus" ]]
-          {
-            echo "XDG_RUNTIME_DIR=/run/user/$uid"
-            echo "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$uid/bus"
-          } >> "$GITHUB_ENV"
-
-      - name: Onboard with the background service
-        env:
-          PAPERCLIPAI_VERSION: ${{ inputs.paperclip_version }}
-          DATA_DIR: ${{ runner.temp }}/service-smoke-data
-          SMOKE_CLEANUP: "false"
-        run: ./scripts/service-onboard-smoke.sh
-
-      - name: Capture service diagnostics
-        if: always()
-        run: |
-          {
-            systemctl --user --no-pager status paperclipai.service || true
-            journalctl --user -u paperclipai.service --no-pager || true
-          } > "$RUNNER_TEMP/paperclipai-service.log" 2>&1
-
-      - name: Upload service diagnostics
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: ${{ inputs.artifact_name }}-service
-          path: ${{ runner.temp }}/paperclipai-service.log
-          retention-days: 14
-
-  smoke:
-    if: inputs.qualification_source_sha == ''
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
-
-    # Fixed here rather than read back out of the harness, so the `always()`
-    # diagnostics steps below still know the container's name when the launch
-    # step is the thing that failed. Reading it back was why a failing smoke
-    # uploaded no Docker logs at all.
-    env:
-      SMOKE_CONTAINER_NAME: release-smoke-onboard
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v7
-
-      - name: Setup pnpm
-        uses: pnpm/action-setup@v6
-        with:
-          version: 9.15.4
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v7
-        with:
-          node-version: 24
-          cache: pnpm
-
-      - name: Install dependencies
-        run: pnpm install --no-frozen-lockfile
-
-      - name: Verify runner Chrome
-        # Release smoke also runs headless on GitHub's Ubuntu image, so use the
-        # runner's preinstalled Chrome instead of a Playwright browser download.
-        run: google-chrome --version
-
-      - name: Launch Docker smoke harness
-        run: |
-          HOST_PORT="${{ inputs.host_port }}" \
-          DATA_DIR="$RUNNER_TEMP/release-smoke-data" \
-          PAPERCLIPAI_VERSION="${{ inputs.paperclip_version }}" \
-          SMOKE_READY_TIMEOUT_SECONDS=420 \
-          SMOKE_DETACH=true \
-          SMOKE_METADATA_FILE="${{ runner.temp }}/release-smoke.env" \
-          SMOKE_LOG_FILE="${{ runner.temp }}/docker-onboard-smoke.log" \
-          ./scripts/docker-onboard-smoke.sh
-          set -a
-          source "${{ runner.temp }}/release-smoke.env"
-          set +a
-          {
-            echo "SMOKE_BASE_URL=$SMOKE_BASE_URL"
-            echo "SMOKE_ADMIN_EMAIL=$SMOKE_ADMIN_EMAIL"
-            echo "SMOKE_ADMIN_PASSWORD=$SMOKE_ADMIN_PASSWORD"
-            echo "SMOKE_DATA_DIR=$SMOKE_DATA_DIR"
-            echo "SMOKE_IMAGE_NAME=$SMOKE_IMAGE_NAME"
-            echo "SMOKE_PAPERCLIPAI_VERSION=$SMOKE_PAPERCLIPAI_VERSION"
-          } >> "$GITHUB_ENV"
-
-      - name: Run release smoke Playwright suite
-        env:
-          PAPERCLIP_RELEASE_SMOKE_BASE_URL: ${{ env.SMOKE_BASE_URL }}
-          PAPERCLIP_RELEASE_SMOKE_EMAIL: ${{ env.SMOKE_ADMIN_EMAIL }}
-          PAPERCLIP_RELEASE_SMOKE_PASSWORD: ${{ env.SMOKE_ADMIN_PASSWORD }}
-          PAPERCLIP_PLAYWRIGHT_CHANNEL: "chrome"
-        run: pnpm run test:release-smoke
-
-      - name: Capture Docker logs
-        if: always()
-        run: |
-          log_file="${{ runner.temp }}/docker-onboard-smoke.log"
-          # A live container has the fuller story, so prefer it. When the
-          # harness already tore the container down it wrote this file on its
-          # way out, and that copy is kept rather than clobbered.
-          if docker inspect "$SMOKE_CONTAINER_NAME" >/dev/null 2>&1; then
-            docker logs "$SMOKE_CONTAINER_NAME" >"$log_file" 2>&1 || true
-          fi
-          # Never leave the upload with nothing to say. An absent log reads as
-          # a missing artifact; a file saying the container was gone reads as
-          # the diagnosis it is.
-          if [[ ! -s "$log_file" ]]; then
-            echo "No Docker logs captured: container '$SMOKE_CONTAINER_NAME' left no log dump and is no longer present." >"$log_file"
-          fi
-          echo "Captured $(wc -l <"$log_file") log lines to $log_file"
-
-      - name: Upload diagnostics
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: ${{ inputs.artifact_name }}
-          path: |
-            ${{ runner.temp }}/docker-onboard-smoke.log
-            ${{ runner.temp }}/release-smoke.env
-            tests/release-smoke/playwright-report/
-            tests/release-smoke/test-results/
-          # The capture step above guarantees the log file, so an empty upload
-          # means the diagnostics wiring itself broke — which is worth failing
-          # over rather than burying in a warning nobody reads.
-          if-no-files-found: error
-          retention-days: 14
-
-      - name: Stop Docker smoke container
-        if: always()
-        run: docker rm -f "$SMOKE_CONTAINER_NAME" >/dev/null 2>&1 || true
-
-  qualification_daemons:
-    if: inputs.qualification_source_sha != ''
-    uses: ./.github/workflows/release-verify.yml
-    with:
-      ref: ${{ inputs.qualification_source_sha }}
-      runner_binaries_only: true
-
-  qualification_pack:
-    if: inputs.qualification_source_sha != ''
-    needs: qualification_daemons
-    name: Assemble and verify public Linux packages
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          ref: ${{ inputs.qualification_source_sha }}
-          persist-credentials: false
-      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
-        with:
-          version: 9.15.4
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
-        with:
-          node-version: 24
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          pattern: ${{ needs.qualification_daemons.outputs.runner_artifact_prefix }}-*
-          path: ${{ runner.temp }}/release-runner-inputs
-          merge-multiple: true
-      - name: Bind the immutable Linux producer source
-        env:
-          SOURCE_SHA: ${{ inputs.qualification_source_sha }}
-        run: |
-          set -euo pipefail
-          [[ "$SOURCE_SHA" =~ ^[a-f0-9]{40}$ ]] || exit 1
-          [[ "$(git rev-parse HEAD)" == "$SOURCE_SHA" ]] || exit 1
-      - name: Build normal workspace outputs and public CLI
-        run: |
-          pnpm install --no-frozen-lockfile
-          pnpm build
-          bash scripts/build-npm.sh --skip-checks --skip-typecheck
-          mv cli/package.dev.json cli/package.json
-      - name: Assemble exact-source daemons before server packing
-        env:
-          SOURCE_SHA: ${{ inputs.qualification_source_sha }}
-        run: |
-          node packages/paperclip-runner/scripts/stage-release-runner-binaries.mjs \
-            assemble-daemons "$RUNNER_TEMP/release-runner-inputs" "$SOURCE_SHA"
-          cp -R packages/paperclip-runner/dist/bin/. server/dist/vendor/paperclip-runner/bin/
-      - name: Verify clean public installation and retain the same package bytes
-        env:
-          PAPERCLIP_RUNNER_PUBLIC_PACKS_DIR: ${{ runner.temp }}/public-runner-packs
-        run: node scripts/verify-grok-npm-install.mjs
-      - name: Locate completed package assembly
-        id: pack_identity
-        if: ${{ !cancelled() }}
-        run: |
-          if [[ -s "$RUNNER_TEMP/public-runner-packs/manifest.json" ]]; then
-            echo "available=true" >> "$GITHUB_OUTPUT"
-          fi
-      - name: Retain completed package assembly even after a later Linux failure
-        if: ${{ !cancelled() && steps.pack_identity.outputs.available == 'true' }}
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: ${{ inputs.artifact_name }}-public-packages
-          path: ${{ runner.temp }}/public-runner-packs/
-          if-no-files-found: error
-          retention-days: 14
-
   qualification_native:
-    if: ${{ !cancelled() && inputs.qualification_source_sha != '' && needs.qualification_daemons.result == 'success' }}
-    needs: [qualification_daemons, qualification_pack]
-    name: Clean installed package (${{ matrix.target }})
-    runs-on: ${{ matrix.host }}
-    timeout-minutes: 30
-    strategy:
-      fail-fast: false
-      matrix: ${{ fromJSON(needs.qualification_daemons.outputs.native_consumer_matrix) }}
+    name: Existing ARM consumer diagnostic (dcdf09a packages)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          ref: ${{ inputs.qualification_source_sha }}
+          ref: 695506ad3912fa63604ca784fda50416fba983d6
           persist-credentials: false
-      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
+      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86
         with:
           version: 9.15.4
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
         with:
           node-version: 24
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          name: ${{ inputs.artifact_name }}-public-packages
-          path: ${{ runner.temp }}/public-runner-packs
-      - name: Install only the existing verifier tooling
-        run: pnpm install --ignore-scripts --no-frozen-lockfile
-      - name: Verify host identity and actual clean npm consumer
+      - name: Bind corrected tooling independently of installed product
         env:
-          SOURCE_SHA: ${{ inputs.qualification_source_sha }}
-          TARGET: ${{ matrix.target }}
+          TOOLING_SHA: 695506ad3912fa63604ca784fda50416fba983d6
         run: |
           set -euo pipefail
-          [[ "$(git rev-parse HEAD)" == "$SOURCE_SHA" ]] || exit 1
-          [[ "$(node -p 'process.platform + "-" + process.arch')" == "$TARGET" ]] || exit 1
-          mode=--mac-consumer
-          if [[ "$TARGET" == linux-arm64 ]]; then mode=--linux-arm64-consumer; fi
-          node scripts/verify-grok-npm-install.mjs "$mode" \
-            "$RUNNER_TEMP/public-runner-packs" "$SOURCE_SHA" "$RUNNER_TEMP/native-public-install.json"
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+          [[ "$(git rev-parse HEAD)" == "$TOOLING_SHA" ]] || exit 1
+          [[ "$(node -p 'process.platform + "-" + process.arch')" == linux-arm64 ]] || exit 1
+          node --input-type=module <<'NODE'
+          import { writeFileSync } from 'node:fs';
+          writeFileSync(process.env.RUNNER_TEMP + '/arm-diagnostic-identity.json', JSON.stringify({
+            schema: 'paperclip.arm.installed-startup-diagnostic/v1', toolingSourceRevision: process.env.TOOLING_SHA,
+            productSourceRevision: 'dcdf09a0f33536fa2b6daaf6e731d921d5711282', providerTurns: 0,
+            buildOrPublishActions: 0, finalCandidateQualification: false,
+          }, null, 2));
+          NODE
+      - name: Verify and reuse the exact completed package archive
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          #!/usr/bin/env bash
+          # Temporary hosted-only diagnostic transfer; no build, publication, or provider.
+          set -euo pipefail
+          : "${RUNNER_TEMP:?Disposable hosted runner scratch is required}"
+          : "${GH_TOKEN:?Read-only GitHub Actions token is required}"
+          [[ "$RUNNER_TEMP" = /* ]] || exit 1
+          transfer="$RUNNER_TEMP/arm-diagnostic-transfer"
+          packages="$RUNNER_TEMP/public-runner-packs"
+          [[ ! -e "$transfer" && ! -e "$packages" ]] || exit 1
+          mkdir -m 700 "$transfer"
+          trap 'rm -f "$transfer/public-packages.zip" "$transfer/materialize.py"' EXIT
+          gh api repos/paperclipai/paperclip/actions/artifacts/11757308120 > "$transfer/artifact-metadata.json"
+          gh api repos/paperclipai/paperclip/actions/artifacts/11757308120/zip > "$transfer/public-packages.zip"
+          cat > "$transfer/materialize.py" <<'ARM_ARTIFACT_GUARD'
+          #!/usr/bin/env python3
+          """One diagnostic transfer of a previously qualified package graph; no execution."""
+          import hashlib,json,os,pathlib,re,stat,sys,zipfile
+          SOURCE='dcdf09a0f33536fa2b6daaf6e731d921d5711282'
+          ARTIFACT=11757308120
+          RUN=38268767165
+          ZIP_SHA='59036218b785492804aafb59e8ec6d50fb92755de7ff0e73a2ddec8e1e3e131e'
+          meta_path,zip_path,destination=map(pathlib.Path,sys.argv[1:])
+          assert meta_path.stat().st_size<65536
+          meta=json.loads(meta_path.read_text())
+          assert meta['id']==ARTIFACT and meta['name']=='codex-four-targets-dcdf09a-20261012-public-packages'
+          assert meta['expired'] is False and meta['digest']=='sha256:'+ZIP_SHA
+          assert meta['workflow_run']['id']==RUN and meta['workflow_run']['head_sha']==SOURCE
+          assert meta['workflow_run']['repository_id']==meta['workflow_run']['head_repository_id']==1170821064
+          assert zip_path.stat().st_size==meta['size_in_bytes'] and zip_path.stat().st_size<200*1024*1024
+          assert hashlib.sha256(zip_path.read_bytes()).hexdigest()==ZIP_SHA
+          assert not destination.exists()
+          with zipfile.ZipFile(zip_path) as archive:
+              members=archive.infolist()
+              assert len(members)==19
+              names=[m.filename for m in members]
+              assert len(set(names))==len(names) and 'manifest.json' in names
+              assert sum(m.file_size for m in members)<200*1024*1024
+              for m in members:
+                  assert not m.is_dir() and '/' not in m.filename and '\\' not in m.filename
+                  assert m.filename=='manifest.json' or re.fullmatch(r'[A-Za-z0-9._-]+\.tgz',m.filename)
+                  assert m.file_size<200*1024*1024 and not (m.flag_bits&1)
+                  assert m.compress_type in (zipfile.ZIP_STORED,zipfile.ZIP_DEFLATED)
+                  kind=stat.S_IFMT(m.external_attr>>16)
+                  assert kind in (0,stat.S_IFREG), 'non-regular artifact member'
+              assert archive.getinfo('manifest.json').file_size<1024*1024
+              manifest=json.loads(archive.read('manifest.json'))
+              assert manifest['schema']=='paperclip.runner.public-packages/v1' and manifest['sourceRevision']==SOURCE
+              records=manifest['archives']; assert len(records)==18
+              assert len(set(r['name'] for r in records))==18
+              assert {'paperclipai','@paperclipai/server'} <= set(r['name'] for r in records)
+              assert set(names)=={'manifest.json',*(r['file'] for r in records)}
+              for record in records:
+                  assert re.fullmatch(r'[A-Za-z0-9._-]+\.tgz',record['file'])
+                  assert re.fullmatch(r'[a-f0-9]{64}',record['sha256'])
+                  assert hashlib.sha256(archive.read(record['file'])).hexdigest()==record['sha256']
+              destination.mkdir(mode=0o700)
+              for member in members:
+                  output=destination/member.filename
+                  with output.open('xb') as stream:stream.write(archive.read(member))
+                  os.chmod(output,0o600)
+          print(json.dumps({'schema':'paperclip.arm-diagnostic.artifact-transfer/v1','artifactId':ARTIFACT,'runId':RUN,
+           'productSourceRevision':SOURCE,'zipSha256':ZIP_SHA,'packageCount':18,'boundedRegularMembersOnly':True,
+           'packageContentHashesVerified':True,'executedPackageCode':False}))
+          ARM_ARTIFACT_GUARD
+          python3 "$transfer/materialize.py" "$transfer/artifact-metadata.json" "$transfer/public-packages.zip" "$packages" > "$RUNNER_TEMP/arm-diagnostic-artifact-transfer.json"
+          cat "$RUNNER_TEMP/arm-diagnostic-artifact-transfer.json"
+          # Parent workflow next invokes the existing ARM consumer from a separately
+          # recorded immutable corrected tooling checkout. The product SHA stays literal:
+          # node scripts/verify-grok-npm-install.mjs --linux-arm64-consumer "$packages" \
+          #   dcdf09a0f33536fa2b6daaf6e731d921d5711282 "$RUNNER_TEMP/native-public-install.json"
+      - name: Install only existing verifier tooling
+        run: pnpm install --ignore-scripts --no-frozen-lockfile
+      - name: Run existing clean ARM consumer with corrected diagnostics
+        run: |
+          set -euo pipefail
+          node scripts/verify-grok-npm-install.mjs --linux-arm64-consumer \
+            "$RUNNER_TEMP/public-runner-packs" dcdf09a0f33536fa2b6daaf6e731d921d5711282 \
+            "$RUNNER_TEMP/native-public-install.json"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
-          name: ${{ inputs.artifact_name }}-${{ matrix.target }}
-          path: ${{ runner.temp }}/native-public-install.json
-          if-no-files-found: warn
+          name: arm-diagnostic-dcdf09a-tools-695506
+          path: |
+            ${{ runner.temp }}/arm-diagnostic-identity.json
+            ${{ runner.temp }}/arm-diagnostic-artifact-transfer.json
+            ${{ runner.temp }}/native-public-install.json
+          if-no-files-found: error
           retention-days: 14
