@@ -500,6 +500,7 @@ export async function prepareProjectRepositoryWorkspaces(input: {
   anchorRepoUrl: string | null;
   workspaces: Array<Pick<typeof projectWorkspaces.$inferSelect, "id" | "repoUrl" | "repoRef"> & { cwd?: string | null }>;
   resolveGitAuth?: GitRemoteAuthProvider | null;
+  beforePublish?: () => Promise<void>;
 }): Promise<Array<{ workspaceId: string; cwd: string; repoUrl: string; repoRef: string | null }>> {
   const identity = (url: string) => url.trim().replace(/\.git\/?$/, "").replace(/\/$/, "");
   const seen = new Set(input.anchorRepoUrl ? [identity(input.anchorRepoUrl)] : []);
@@ -526,7 +527,7 @@ export async function prepareProjectRepositoryWorkspaces(input: {
     const localSource = workspace.cwd && workspace.cwd !== REPO_ONLY_CWD_SENTINEL
       && await fs.stat(workspace.cwd).then((entry) => entry.isDirectory()).catch(() => false)
       ? workspace.cwd : null;
-    const result = await materializeManagedProjectWorkspace(cwd, { repoUrl, repoRef: workspace.repoRef, localSource, resolveGitAuth: input.resolveGitAuth });
+    const result = await materializeManagedProjectWorkspace(cwd, { repoUrl, repoRef: workspace.repoRef, localSource, resolveGitAuth: input.resolveGitAuth, beforePublish: input.beforePublish });
     if (result.warning) throw new Error(result.warning);
     results.push({ workspaceId: workspace.id, cwd, repoUrl, repoRef: workspace.repoRef });
   }
@@ -3591,12 +3592,12 @@ export function createHeartbeatWorkspaceResolver(db: Db) {
     const executionEnvironmentDriver = opts?.executionEnvironmentDriver ?? null;
     const issueId =
       readNonEmptyString(context.issueId) ?? readNonEmptyString(context.taskId);
+    const responsibleUserId = readNonEmptyString(context.responsibleUserId)
+      ?? readNonEmptyString(context.responsible_user_id);
     const resolveGitAuth = createGitRemoteAuthProvider(db, agent.companyId, {
       issueId,
       heartbeatRunId: readNonEmptyString(context.executionIdentityRunId),
-      responsibleUserId:
-        readNonEmptyString(context.responsibleUserId) ??
-        readNonEmptyString(context.responsible_user_id),
+      responsibleUserId,
       agentId: agent.id,
     });
     const { additionalWorkspaces, warnings, failures } =
@@ -3615,6 +3616,8 @@ export function createHeartbeatWorkspaceResolver(db: Db) {
           agentId: agent.id,
           companyId: agent.companyId,
           source: "agent_key",
+          runId: readNonEmptyString(context.executionIdentityRunId),
+          onBehalfOfUserId: responsibleUserId === "local-board" ? null : responsibleUserId,
         },
         issues: issueService(db),
         projects: projectService(db),

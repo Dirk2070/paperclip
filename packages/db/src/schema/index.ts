@@ -247,4 +247,5 @@ export { aiSubscriptions, aiSubscriptionPrices, aiSubscriptionConnections } from
 
 export { executionWorkspaceRepositories } from "./execution_workspace_repositories.js";
 export { executionWorkspaceRepositoryRoots } from "./execution_workspace_repository_roots.js";
+export { executionWorkspaceRepositoryAccess } from "./execution_workspace_repository_access.js";
 export * from "./fast_responses.js";

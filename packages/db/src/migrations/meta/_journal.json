@@ -2339,6 +2339,13 @@
       "when": 1791807232294,
       "tag": "0335_oval_screwball",
       "breakpoints": true
+    },
+    {
+      "idx": 336,
+      "version": "7",
+      "when": 1791809240988,
+      "tag": "0336_chilly_hulk",
+      "breakpoints": true
     }
   ]
 }

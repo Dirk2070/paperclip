@@ -2397,8 +2397,6 @@ export function heartbeatService(
       const [selectedWorkspaceSource] = !boundSourceWorkspace && issueContext?.projectWorkspaceId
         ? await db.select({ projectId: projectWorkspaces.projectId }).from(projectWorkspaces)
           .where(and(eq(projectWorkspaces.id, issueContext.projectWorkspaceId), eq(projectWorkspaces.companyId, agent.companyId))) : [];
-      const executionProjectId = boundSourceWorkspace ? boundSourceWorkspace.projectId
-        : taskWorkspaceIntentRow?.intent?.selection.kind === "task_directory" ? null : selectedWorkspaceSource?.projectId ?? issueContext?.projectId ?? contextProjectId;
       const loadProjectContext = async (projectId: string | null | undefined) => projectId
         ? await db
             .select({
@@ -2410,6 +2408,8 @@ export function heartbeatService(
                   .where(and(
                     eq(projectWorkspaces.projectId, projects.id),
                     eq(projectWorkspaces.companyId, agent.companyId),
+                    sql`(nullif(btrim(${projectWorkspaces.cwd}), '') is not null
+                      or nullif(btrim(${projectWorkspaces.repoUrl}), '') is not null)`,
                   )),
               ).mapWith(Boolean),
               env: projects.env,
@@ -2426,6 +2426,11 @@ export function heartbeatService(
         : null;
       const taskProjectId = issueContext ? issueContext.projectId : contextProjectId;
       const taskProjectContext = await loadProjectContext(taskProjectId);
+      // Organizational placement supplies environment and trust, not an
+      // implicit filesystem source when that project has no configured files.
+      const executionProjectId = boundSourceWorkspace ? boundSourceWorkspace.projectId
+        : taskWorkspaceIntentRow?.intent?.selection.kind === "task_directory" ? null
+          : selectedWorkspaceSource?.projectId ?? (taskProjectContext?.hasWorkspace ? taskProjectId : null);
       if (issueContext) {
         if (taskProjectId) context.projectId = taskProjectId;
         else delete context.projectId;
@@ -2540,9 +2545,16 @@ export function heartbeatService(
           );
         issueContext = { ...issueContext, responsibleUserId };
       }
+      // Legacy unbound tasks still inherit explicit organizational workspace
+      // requirements even when that project has no files to use as a source.
+      // A typed choice or durable binding keeps its own source policy.
+      const workspacePolicyContext = workspaceProjectContext ?? (
+        !boundSourceWorkspace && !taskWorkspaceIntentRow?.intent && !issueContext?.projectWorkspaceId
+          ? taskProjectContext : null
+      );
       const parsedProjectExecutionWorkspacePolicy =
         parseProjectExecutionWorkspacePolicy(
-          workspaceProjectContext?.executionWorkspacePolicy,
+          workspacePolicyContext?.executionWorkspacePolicy,
         );
       const projectExecutionWorkspacePolicy =
         applyDefaultIsolatedExecutionWorkspacePolicy({

@@ -3338,11 +3338,18 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     });
   });
 
-  it("dispatches local native external chat inside the server-selected task root", async () => {
+  it.each(["projectless", "organization_only", "empty_source"] as const)("dispatches local native external chat inside the server-selected task root: %s", async placement => {
     await withTempPaperclipHome(async () => {
       const { companyId, agentId, issueId, runId } =
         await seedQueuedIssueRunFixture();
       await fs.mkdir(resolvePaperclipInstanceRoot(), { recursive: true });
+      const projectId = placement === "projectless" ? null : randomUUID();
+      if (projectId) {
+        await db.insert(projects).values({ id: projectId, companyId, name: "Chat channel project default" });
+        if (placement === "empty_source") {
+          await db.insert(projectWorkspaces).values({ companyId, projectId, name: "Unconfigured source", cwd: "  ", repoUrl: null });
+        }
+      }
       await db
         .update(agents)
         .set({
@@ -3352,7 +3359,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         .where(eq(agents.id, agentId));
       await db
         .update(issues)
-        .set({ originKind: "chat_channel" })
+        .set({ originKind: "chat_channel", projectId })
         .where(eq(issues.id, issueId));
       await db
         .update(heartbeatRuns)
@@ -3390,6 +3397,10 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       expect(input.workspace.cwd).not.toBe(
         resolveDefaultAgentWorkspaceDir(agentId),
       );
+      const [task] = await db.select().from(issues).where(eq(issues.id, issueId));
+      const [workspace] = await db.select().from(executionWorkspaces).where(eq(executionWorkspaces.id, task.executionWorkspaceId!));
+      expect(task.projectId).toBe(projectId);
+      expect(workspace).toMatchObject({ sourceIssueId: issueId, projectId: null, projectWorkspaceId: null, cwd: input.workspace.cwd });
       expect(mockAdapterExecute).not.toHaveBeenCalled();
     });
   });

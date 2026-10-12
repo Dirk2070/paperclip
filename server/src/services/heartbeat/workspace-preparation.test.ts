@@ -1,7 +1,8 @@
 import { execFile as execFileCallback } from "node:child_process";
-import { mkdtemp, mkdir, readFile, rm, writeFile, access } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, readdir, rm, writeFile, access } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import { captureDirectorySnapshot, directorySnapshotSha256, serializeDirectorySnapshot } from "@paperclipai/adapter-utils/workspace-restore-merge";
 import type { AdapterExecutionTarget } from "@paperclipai/adapter-utils/execution-target";
@@ -112,6 +113,37 @@ describe.skipIf(!support.supported)("heartbeat workspace preparation boundary", 
     expect(input.nativeRunnerPreparationSpans.map(span => span.name)).toEqual(["environment.acquire", "environment.workspace.realize"]);
     expect(input.nativeRunnerPreparationSpans.every(span => span.parentName === "task.provider_session")).toBe(true);
     expect(input.controllerLease.assertOwned).toHaveBeenCalledTimes(2);
+  });
+
+  it("checks physical root admission before publishing configured sibling repositories", async () => {
+    const { input, source, issue } = await fixture();
+    await db.insert(projectWorkspaces).values({ companyId: issue.companyId, projectId: issue.projectId!,
+      name: "Sibling repository", repoUrl: pathToFileURL(source).href });
+    vi.spyOn(input.services.executionWorkspacesSvc, "prepareTaskRepositoriesForAdmission")
+      .mockRejectedValue(new Error("Physical root reader cannot access this source"));
+    const acquire = vi.spyOn(input.services.envOrchestrator, "acquireForRun");
+    await expect(prepareHeartbeatWorkspace(db, input)).rejects.toThrow("Physical root reader cannot access this source");
+    await expect(access(join(source, ".paperclip-repositories"))).rejects.toMatchObject({ code: "ENOENT" });
+    expect(acquire).not.toHaveBeenCalled();
+  });
+
+  it("rechecks physical root access after configured clone and before publication", async () => {
+    const { input, source, issue } = await fixture();
+    await db.insert(projectWorkspaces).values({ companyId: issue.companyId, projectId: issue.projectId!,
+      name: "Sibling repository", repoUrl: pathToFileURL(source).href });
+    const namespace = join(source, ".paperclip-repositories");
+    const guard = vi.spyOn(input.services.executionWorkspacesSvc, "guardTaskRepositoryRootForPublication")
+      .mockImplementation(async () => {
+        const candidates = await readdir(namespace);
+        expect(candidates).toHaveLength(1);
+        expect(candidates[0]).toContain(".clone-");
+        expect(await readFile(join(namespace, candidates[0]!, "README.md"), "utf8")).toBe("source content\n");
+        throw new Error("Physical root access revoked during clone");
+      });
+    await expect(prepareHeartbeatWorkspace(db, input)).rejects.toThrow("Physical root access revoked during clone");
+    expect(guard).toHaveBeenCalledOnce();
+    expect(await readdir(namespace)).toEqual([]);
+    expect(await leases(input.run.id)).toEqual([]);
   });
 
   it("persists and reuses task-owned files without adopting the organizational project as their source", async () => {

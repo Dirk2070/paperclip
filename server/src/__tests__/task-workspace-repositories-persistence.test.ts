@@ -245,7 +245,7 @@ const support = await getEmbeddedPostgresTestSupport();
     const [retainedWorkspace] = await db.select().from(executionWorkspaces).where(eq(executionWorkspaces.id, workspaceId));
     expect(retainedWorkspace.metadata?._issuePrivacySources).toMatchObject({ [privateSource.id]: true });
     // Reauthorization also applies after the second inventory has a durable pin.
-    await expect(prepareForAdmission(admission)).rejects.toThrow(/outside this actor's access/);
+    await expect(prepareForAdmission(admission)).rejects.toThrow(/Task workspace access is no longer available/);
     expect(await readFile(path.join(prepared[0].cwd, "source.txt"), "utf8")).toBe("uncommitted work\n");
   });
   it("stages a root change without replacing active files or adding a wake", async () => {

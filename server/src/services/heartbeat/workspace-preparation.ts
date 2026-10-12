@@ -126,7 +126,7 @@ export interface HeartbeatWorkspacePreparationInput {
   };
   services: {
     envOrchestrator: Pick<ReturnType<typeof environmentRunOrchestrator>, "resolveEnvironment" | "acquireForRun" | "realizeForRun">;
-    executionWorkspacesSvc: Pick<ReturnType<typeof executionWorkspaceService>, "create" | "update" | "bindTaskWorkspace" | "prepareTaskRepositoriesForAdmission" | "reserveTaskRepositoryRootForRecovery">;
+    executionWorkspacesSvc: Pick<ReturnType<typeof executionWorkspaceService>, "create" | "update" | "bindTaskWorkspace" | "prepareTaskRepositoriesForAdmission" | "guardTaskRepositoryRootForPublication" | "reserveTaskRepositoryRootForRecovery">;
     workspaceOperationsSvc: Pick<ReturnType<typeof workspaceOperationService>, "createRecorder">;
     resolveWorkspaceForRun: WorkspaceResolver["resolveWorkspaceForRun"];
     resolveReusedGitWorkspaceAnchor: WorkspaceResolver["resolveReusedGitWorkspaceAnchor"];
@@ -860,6 +860,12 @@ export async function prepareHeartbeatWorkspace(db: Db, input: HeartbeatWorkspac
   }
   await bindIssueToPersistedExecutionWorkspace(persistedExecutionWorkspace);
   const projectRepositoryPaths: string[] = [];
+  if (persistedExecutionWorkspace && issueId && !persistedNativeExecutionInput && !nativeRecoveryExecutionWorkspaceId) {
+    const taskRepositories = await executionWorkspacesSvc.prepareTaskRepositoriesForAdmission({ companyId: agent.companyId,
+      issueId, workspaceId: persistedExecutionWorkspace.id, cwd: executionWorkspace.cwd,
+      agentId: agent.id, runId: run.id, responsibleUserId });
+    projectRepositoryPaths.push(...taskRepositories.map(repository => repository.relativePath));
+  }
   if (executionWorkspace.projectId
     && (resolvedWorkspace.source === "project_primary" || Boolean(reusableExistingExecutionWorkspace?.projectWorkspaceId))
     && !resolvedWorkspace.baseCwdFallback && !persistedNativeExecutionInput) {
@@ -872,6 +878,11 @@ export async function prepareHeartbeatWorkspace(db: Db, input: HeartbeatWorkspac
       anchorRepoUrl: executionWorkspace.repoUrl,
       workspaces: repositoryRows,
       resolveGitAuth: workspaceGitAuthProvider,
+      beforePublish: persistedExecutionWorkspace && issueId && !nativeRecoveryExecutionWorkspaceId
+        ? () => executionWorkspacesSvc.guardTaskRepositoryRootForPublication({
+            companyId: agent.companyId, issueId, workspaceId: persistedExecutionWorkspace!.id,
+            cwd: executionWorkspace.cwd, agentId: agent.id, runId: run.id,
+          }) : undefined,
     });
     const paths = new Map(repositories.map((repo) => [repo.workspaceId, repo.cwd]));
     projectRepositoryPaths.push(...repositories.map((repo) => path.relative(executionWorkspace.cwd, repo.cwd)));
@@ -884,12 +895,6 @@ export async function prepareHeartbeatWorkspace(db: Db, input: HeartbeatWorkspac
       repoUrl: readNonEmptyString(source.repoUrl),
       repoRef: readNonEmptyString(source.repoRef),
     }));
-  }
-  if (persistedExecutionWorkspace && issueId && !persistedNativeExecutionInput && !nativeRecoveryExecutionWorkspaceId) {
-    const taskRepositories = await executionWorkspacesSvc.prepareTaskRepositoriesForAdmission({ companyId: agent.companyId,
-      issueId, workspaceId: persistedExecutionWorkspace.id, cwd: executionWorkspace.cwd,
-      agentId: agent.id, runId: run.id, responsibleUserId });
-    projectRepositoryPaths.push(...taskRepositories.map(repository => repository.relativePath));
   }
   if (persistedExecutionWorkspace) {
     context.executionWorkspaceId = persistedExecutionWorkspace.id;

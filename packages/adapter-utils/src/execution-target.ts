@@ -1447,9 +1447,10 @@ export async function prepareAdapterExecutionTargetRuntime(input: {
   workspaceSeedCacheCompanyDirectory?: string;
   workspaceBaseline?: DirectorySnapshot;
   workspaceGitSnapshot?: GitWorkspaceSnapshot | null;
+  /** Without a Git snapshot, undefined discovers managed task repositories; [] keeps plain directories uninterpreted. */
   workspaceRepositories?: NonNullable<GitWorkspaceSnapshot["repositories"]>;
   workspaceExclude?: string[];
-  /** Plain persistent directories include all files, independent of Git and task cache exclusions. */
+  /** Includes ordinary ignored/cache files; plain directories also set workspaceGitSnapshot: null and workspaceRepositories: []. */
   workspaceFileMode?: "all";
   preserveAbsentOnRestore?: string[];
   assets?: AdapterManagedRuntimeAsset[];

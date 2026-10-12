@@ -5,13 +5,13 @@ import fs from "node:fs/promises";
 import { constants as fsConstants } from "node:fs";
 import path from "node:path";
 import { and, eq, isNotNull, or, sql } from "drizzle-orm";
-import { activityLog, agents, heartbeatRuns, projects, executionWorkspaceRepositoryRoots, executionWorkspaceRepositories, executionWorkspaces, issues, type Db } from "@paperclipai/db";
+import { activityLog, agents, heartbeatRuns, projects, executionWorkspaceRepositoryAccess, executionWorkspaceRepositoryRoots, executionWorkspaceRepositories, executionWorkspaces, issues, type Db } from "@paperclipai/db";
 import { prepareWorkspaceRepositorySchema, type PrepareWorkspaceRepository, type ProjectRepository } from "@paperclipai/shared";
 import { withDirectoryPublicationLock } from "@paperclipai/adapter-utils/workspace-restore-merge";
 import { conflict, forbidden, notFound } from "../errors.js";
 import { parseNativeExecutionInput } from "../vendor/paperclip-runner/index.js";
 import { assertTaskWorkspaceAccess } from "./task-workspace-source-access.js";
-import { authorizationService, canActorReadExecutionWorkspace, issueReadSqlCondition, type AuthorizationActor } from "./authorization.js";
+import { authorizationService, canActorReadExecutionWorkspace, executionWorkspaceReadSqlCondition, issueReadSqlCondition, type AuthorizationActor } from "./authorization.js";
 import { resolveCoreTrustPreset } from "./trust-preset-resolver.js";
 import { captureRunIdentity } from "./run-identity.js";
 import { toolAccessService } from "./tool-access.js";
@@ -168,6 +168,120 @@ export function executionWorkspaceRepositoryService(db: Db) {
     if (!existing) await tx.insert(executionWorkspaceRepositoryRoots).values({ companyId, canonicalCwd, rootKey, mode });
     return canonicalCwd;
   }
+  type RootReader = { runId: string; issueId: string; agentId: string };
+  async function authorizeRootAccess(tx: DbTransaction, input: {
+    companyId: string; cwd: string; sourceWorkspaceId?: string; reader?: RootReader; actor?: AuthorizationActor; preserveOwnAdmission?: boolean;
+  }) {
+    const canonicalCwd = await canonicalRepositoryRoot(input.cwd);
+    const rootKey = createHash("sha256").update(canonicalCwd).digest("hex");
+    const entries = await tx.select().from(executionWorkspaceRepositoryAccess).where(and(
+      eq(executionWorkspaceRepositoryAccess.companyId, input.companyId), eq(executionWorkspaceRepositoryAccess.rootKey, rootKey)));
+    if (entries.some(entry => entry.canonicalCwd !== canonicalCwd)) throw forbidden("Repository root identity conflicts with its retained access record");
+    const sourceIds = new Set(entries.filter(entry => entry.kind === "source").map(entry => entry.scopeId));
+    if (input.sourceWorkspaceId) sourceIds.add(input.sourceWorkspaceId);
+    if (!entries.some(entry => entry.kind === "reader")) {
+      // Bootstrap ordinary task files as well as acquisition receipts. Later
+      // admissions retain their sources here before they can write this root.
+      const workspaces = await tx.select({ id: executionWorkspaces.id, cwd: executionWorkspaces.cwd }).from(executionWorkspaces)
+        .where(eq(executionWorkspaces.companyId, input.companyId));
+      for (const workspace of workspaces) {
+        if (!workspace.cwd) continue;
+        const peerRoot = await canonicalRepositoryRoot(workspace.cwd).catch((error: NodeJS.ErrnoException) => {
+          if (["ENOTDIR", "EACCES", "EPERM"].includes(error.code ?? "")) return null;
+          throw error;
+        });
+        if (peerRoot === canonicalCwd) sourceIds.add(workspace.id);
+      }
+    }
+    const inventory = await tx.select({ workspaceId: executionWorkspaces.id, cwd: executionWorkspaces.cwd,
+      identity: executionWorkspaceRepositories.repositoryIdentity }).from(executionWorkspaceRepositories)
+      .innerJoin(executionWorkspaces, eq(executionWorkspaces.id, executionWorkspaceRepositories.executionWorkspaceId))
+      .where(and(eq(executionWorkspaceRepositories.companyId, input.companyId), eq(executionWorkspaces.companyId, input.companyId)));
+    const namespace = path.join(canonicalCwd, ".paperclip-repositories");
+    const namespaceEntry = await fs.lstat(namespace).catch((error: NodeJS.ErrnoException) => {
+      if (error.code === "ENOENT") return null;
+      throw error;
+    });
+    const publishedNames = new Set<string>();
+    if (namespaceEntry) {
+      if (!namespaceEntry.isDirectory() || namespaceEntry.isSymbolicLink() || await fs.realpath(namespace) !== namespace) {
+        throw forbidden("Repository namespace has no verifiable contained ownership");
+      }
+      // Configured project siblings have a separate source owner. This child
+      // aggregate owns only task-repo-* publications and their retained provenance.
+      for (const name of await fs.readdir(namespace)) if (name.startsWith("task-repo-")) publishedNames.add(name);
+    }
+    const recognizedNames = new Set<string>();
+    for (const peer of inventory) {
+      const name = path.basename(taskRepositoryRelativePath(peer.identity));
+      const published = publishedNames.has(name);
+      if (published) recognizedNames.add(name);
+      // Once a reader was admitted, future sources must be registered through
+      // this fence. Still reconcile physical publications from older versions.
+      if (published || (!entries.some(entry => entry.kind === "reader") && peer.cwd && await legacyRepositoryRootMayMatch(peer.cwd, canonicalCwd))) {
+        sourceIds.add(peer.workspaceId);
+      }
+    }
+    if ([...publishedNames].some(name => !recognizedNames.has(name))) throw forbidden("Published repository has no retained workspace provenance");
+    const readers = entries.filter(entry => entry.kind === "reader");
+    if (input.reader && !readers.some(reader => reader.scopeId === input.reader!.runId)) {
+      const [run] = await tx.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.id, input.reader.runId), eq(heartbeatRuns.companyId, input.companyId)));
+      readers.push({ id: randomUUID(), companyId: input.companyId, rootKey, canonicalCwd, kind: "reader", scopeId: input.reader.runId,
+        issueId: input.reader.issueId, agentId: input.reader.agentId, responsibleUserId: run?.responsibleUserId ?? null, createdAt: new Date(), updatedAt: new Date() });
+    }
+    // Heartbeat owns ordinary admission to this task's already-authorized
+    // folder. Avoid adding acquisition permissions when it is the only task
+    // and has no acquisition. Any other task/source requires the full closure.
+    const ownAdmissionOnly = input.preserveOwnAdmission && input.reader && input.sourceWorkspaceId
+      && sourceIds.size === 1 && sourceIds.has(input.sourceWorkspaceId)
+      && readers.every(reader => reader.issueId === input.reader!.issueId);
+    for (const reader of readers) {
+      const [run] = await tx.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.id, reader.scopeId), eq(heartbeatRuns.companyId, input.companyId)));
+      const [agent] = reader.agentId ? await tx.select({ id: agents.id }).from(agents).where(and(eq(agents.id, reader.agentId), eq(agents.companyId, input.companyId))) : [];
+      const [issue] = reader.issueId ? await tx.select().from(issues).where(and(eq(issues.id, reader.issueId), eq(issues.companyId, input.companyId))) : [];
+      if (!run || !agent || !issue || run.agentId !== reader.agentId || run.responsibleUserId !== reader.responsibleUserId
+        || (run.nativeIssueId ?? run.contextSnapshot?.issueId ?? run.contextSnapshot?.taskId ?? run.issueId) !== reader.issueId) {
+        throw forbidden("Repository root retains a reader whose identity is no longer available");
+      }
+      const actor: AuthorizationActor = { type: "agent", source: "agent_jwt", companyId: input.companyId,
+        agentId: reader.agentId!, runId: reader.scopeId, onBehalfOfUserId: reader.responsibleUserId === "local-board" ? null : reader.responsibleUserId };
+      if (ownAdmissionOnly) {
+        const [ownSource] = await tx.select({ id: executionWorkspaces.id }).from(executionWorkspaces).where(and(
+          eq(executionWorkspaces.companyId, input.companyId), eq(executionWorkspaces.id, input.sourceWorkspaceId!),
+          // Check both privacy principals without repeating the membership
+          // admission gate that heartbeat already owns for this exact task.
+          await executionWorkspaceReadSqlCondition(tx, { ...actor, onBehalfOfUserId: null }),
+          actor.onBehalfOfUserId ? await executionWorkspaceReadSqlCondition(tx, {
+            type: "board", userId: actor.onBehalfOfUserId, ignoreInstanceAdmin: true,
+          }) : undefined));
+        if (!ownSource) throw forbidden("Task workspace access is no longer available");
+      } else for (const sourceId of sourceIds) await assertTaskWorkspaceAccess(tx, actor, input.companyId, sourceId);
+      const sourceWorkspaces = sourceIds.size ? await tx.select().from(executionWorkspaces).where(and(
+        eq(executionWorkspaces.companyId, input.companyId), or(...[...sourceIds].map(id => eq(executionWorkspaces.id, id))))) : [];
+      for (const sourceWorkspace of sourceWorkspaces.length ? sourceWorkspaces : [null]) {
+        if (await requiresAnonymousAcquisition(tx, { issue, workspace: sourceWorkspace, agentId: reader.agentId!, runId: reader.scopeId })) {
+          // Retained readers cannot gain managed bytes after their task, agent,
+          // run, or any retained physical source becomes anonymous-only.
+          await reserveRootPolicy(tx, input.companyId, canonicalCwd, "anonymous_only");
+        }
+      }
+    }
+    if (input.actor) for (const sourceId of sourceIds) await assertTaskWorkspaceAccess(tx, input.actor, input.companyId, sourceId);
+    for (const sourceId of sourceIds) {
+      if (!entries.some(entry => entry.kind === "source" && entry.scopeId === sourceId)) {
+        await tx.insert(executionWorkspaceRepositoryAccess).values({ companyId: input.companyId, rootKey, canonicalCwd, kind: "source", scopeId: sourceId });
+      }
+    }
+    for (const reader of readers) {
+      if (!entries.some(entry => entry.kind === "reader" && entry.scopeId === reader.scopeId)) await tx.insert(executionWorkspaceRepositoryAccess).values(reader);
+    }
+  }
+  async function reserveRootAccess(input: Parameters<typeof authorizeRootAccess>[1]) {
+    return db.transaction(async tx => {
+      await lockRootPolicies(tx, input.companyId);
+      await authorizeRootAccess(tx, input);
+    });
+  }
   async function reserveAdmissionRoot(companyId: string, cwd: string, mode: "anonymous_only" | "managed") {
     return db.transaction(async tx => {
       await lockRootPolicies(tx, companyId);
@@ -215,6 +329,8 @@ export function executionWorkspaceRepositoryService(db: Db) {
         if (!workspace.cwd) throw conflict("The task workspace has no directory for repository preparation");
         await reserveRootPolicy(tx, input.companyId, workspace.cwd, anonymousOnly ? "anonymous_only" : "managed");
       }
+      if (!workspace.cwd) throw conflict("The task workspace has no directory for repository preparation");
+      await authorizeRootAccess(tx, { companyId: input.companyId, cwd: workspace.cwd, sourceWorkspaceId: workspace.id, actor: input.actor });
       const existing = await tx.select().from(executionWorkspaceRepositories).where(and(eq(executionWorkspaceRepositories.executionWorkspaceId, workspace.id), or(eq(executionWorkspaceRepositories.repositoryIdentity, source.repositoryIdentity), sql`${executionWorkspaceRepositories.requestKeys} ? ${parsed.requestKey}`)));
       for (const row of existing) {
         assertAcquisitionReceipt(row, anonymousOnly);
@@ -237,6 +353,20 @@ export function executionWorkspaceRepositoryService(db: Db) {
   }
   async function list(companyId: string, workspaceId: string) {
     return db.select().from(executionWorkspaceRepositories).where(and(eq(executionWorkspaceRepositories.companyId, companyId), eq(executionWorkspaceRepositories.executionWorkspaceId, workspaceId)));
+  }
+  /** Configured-source publication shares this root, but does not acquire a repository. */
+  async function guardForPublication(input: { companyId: string; issueId: string; workspaceId: string; cwd: string; agentId: string; runId: string }) {
+    await db.transaction(async tx => {
+      await lockRootPolicies(tx, input.companyId);
+      const [issue] = await tx.select().from(issues).where(and(eq(issues.id, input.issueId), eq(issues.companyId, input.companyId)));
+      const [workspace] = await tx.select().from(executionWorkspaces).where(and(eq(executionWorkspaces.id, input.workspaceId), eq(executionWorkspaces.companyId, input.companyId)));
+      if (!issue || !workspace || issue.executionWorkspaceId !== workspace.id || !workspace.cwd
+        || await canonicalRepositoryRoot(workspace.cwd) !== await canonicalRepositoryRoot(input.cwd)) {
+        throw forbidden("Task repository publication binding is unavailable");
+      }
+      await requiresAnonymousAcquisition(tx, { issue, workspace, agentId: input.agentId, runId: input.runId });
+      await authorizeRootAccess(tx, { companyId: input.companyId, cwd: input.cwd, sourceWorkspaceId: workspace.id, reader: input });
+    });
   }
   /** Recovery keeps its admitted identity and folder; only fence future publication. */
   async function reserveForRecovery(input: { companyId: string; issueId: string; workspaceId: string; cwd: string; agentId: string; runId: string }) {
@@ -262,6 +392,9 @@ export function executionWorkspaceRepositoryService(db: Db) {
     else if ((await list(input.companyId, input.workspaceId)).some(row => row.catalogRepositoryId)) {
       await reserveAdmissionRoot(input.companyId, input.cwd, "managed");
     }
+    await reserveRootAccess({ companyId: input.companyId, cwd: input.cwd, reader: input,
+      ...(workspace ? { sourceWorkspaceId: workspace.id } : {}),
+      preserveOwnAdmission: !(await list(input.companyId, input.workspaceId)).length });
   }
   /** Logical rows may deliberately name one physical folder. Reuse bytes only
    * after validating every published owner's retained privacy and source intent. */
@@ -300,6 +433,8 @@ export function executionWorkspaceRepositoryService(db: Db) {
     // Ordinary admission without acquisitions is owned by heartbeat, not this mutation service.
     if (!rows.length) {
       if (anonymousOnly) await reserveAdmissionRoot(input.companyId, input.cwd, "anonymous_only");
+      await reserveRootAccess({ companyId: input.companyId, cwd: input.cwd, reader: input,
+        sourceWorkspaceId: workspace.id, preserveOwnAdmission: true });
       return [];
     }
     await assertTaskWorkspaceAccess(db, actor, input.companyId, input.workspaceId, { write: true, issueId: input.issueId });
@@ -315,6 +450,7 @@ export function executionWorkspaceRepositoryService(db: Db) {
       const reservedRoot = await reserveAdmissionRoot(input.companyId, root, anonymousOnly ? "anonymous_only" : "managed");
       if (reservedRoot !== root) throw conflict("Repository workspace root changed during admission");
     }
+    await reserveRootAccess({ companyId: input.companyId, cwd: root, sourceWorkspaceId: input.workspaceId, reader: input });
     const repositoryRoot = path.join(root, ".paperclip-repositories");
     await fs.mkdir(repositoryRoot, { recursive: true });
     if ((await fs.lstat(repositoryRoot)).isSymbolicLink() || await fs.realpath(repositoryRoot) !== repositoryRoot) throw conflict("Repository directory escapes the task workspace");
@@ -388,6 +524,7 @@ export function executionWorkspaceRepositoryService(db: Db) {
             repoRef: authorizedPin ?? (row.requestedRef === "HEAD" ? null : row.requestedRef),
             resolveGitAuth: source.catalogRepositoryId ? resolveAuth : async () => anonymous,
             beforePublish: async cloneCwd => {
+              await reserveRootAccess({ companyId: input.companyId, cwd: root, sourceWorkspaceId: input.workspaceId, reader: input });
               const pinnedCommit = (await execFile("git", ["-C", cloneCwd, "rev-parse", "HEAD"], { timeout: 30_000 })).stdout.trim();
               await fs.writeFile(path.join(cloneCwd, ".git", "paperclip-workspace-owner.json"), JSON.stringify({ version: 1, repositoryId: row.id, pinnedCommit }), { flag: "wx", mode: 0o600 });
             },
@@ -411,5 +548,5 @@ export function executionWorkspaceRepositoryService(db: Db) {
     }
     return prepared;
   }
-  return { request, list, prepareForAdmission, reserveForRecovery };
+  return { request, list, prepareForAdmission, reserveForRecovery, guardForPublication };
 }
