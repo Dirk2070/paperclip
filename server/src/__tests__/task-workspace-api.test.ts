@@ -1,4 +1,6 @@
 import { randomUUID } from "node:crypto";
+import { mkdtemp } from "node:fs/promises";
+import { dirname, join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { eq } from "drizzle-orm";
 import { agents, executionWorkspaceRepositories, executionWorkspaces, issues, heartbeatRuns } from "@paperclipai/db";
@@ -87,6 +89,13 @@ const support = await getEmbeddedPostgresTestSupport();
     await server.db.update(agents).set({ permissions: policy([f.projectId]) }).where(eq(agents.id, f.agentId));
     await expect(call("get_workspace", {})).resolves.toMatchObject({ workspace: { id: source.id, projectId: f.projectId } });
     await expect(call("select_workspace", { selection: { kind: "existing", workspaceId: source.id }, expectedBindingRevision: 0, requestKey: "source-allowed" })).resolves.toMatchObject({ kind: "scheduled" });
+    // Project permission cannot expose the unrelated task's files through a
+    // shared physical root. Give that fixture its own folder before testing
+    // the permitted source-only preparation path.
+    await expect(call("prepare_repository", repository)).rejects.toThrow(/outside.*boundary/i);
+    expect(await server.db.select().from(executionWorkspaceRepositories).where(eq(executionWorkspaceRepositories.companyId, f.companyId))).toHaveLength(0);
+    const unrelatedCwd = await mkdtemp(join(dirname(f.workspace), "unrelated-workspace-"));
+    await server.db.update(executionWorkspaces).set({ cwd: unrelatedCwd }).where(eq(executionWorkspaces.id, unrelated.id));
     await expect(call("prepare_repository", repository)).resolves.toMatchObject({ kind: "requires_next_admission" });
     expect((await server.db.select().from(issues).where(eq(issues.id, f.issueId)))[0]?.projectId).toBeNull();
   });
