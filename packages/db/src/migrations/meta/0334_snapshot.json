@@ -1,6 +1,6 @@
 {
-  "id": "77110fc0-2a50-45eb-913d-e507ba74439a",
-  "prevId": "64c77972-2c34-4fb7-ba72-f48dadcf794d",
+  "id": "a534b058-84e4-42be-a795-143fdd738b37",
+  "prevId": "fb1a65b0-7eff-4e5a-a023-fecec51f938c",
   "version": "7",
   "dialect": "postgresql",
   "tables": {
@@ -19637,6 +19637,34 @@
           "method": "btree",
           "with": {}
         },
+        "cost_events_data_quality_idx": {
+          "name": "cost_events_data_quality_idx",
+          "columns": [
+            {
+              "expression": "company_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "occurred_at",
+              "isExpression": false,
+              "asc": false,
+              "nulls": "last"
+            },
+            {
+              "expression": "id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "where": "\"cost_events\".\"billing_type\" = 'unknown' or (\"cost_events\".\"cost_status\" = 'unpriced' and \"cost_events\".\"billing_type\" <> 'subscription_included')",
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
         "cost_events_company_occurred_idx": {
           "name": "cost_events_company_occurred_idx",
           "columns": [
@@ -26488,100 +26516,6 @@
       "checkConstraints": {},
       "isRLSEnabled": false
     },
-    "public.execution_workspace_repository_roots": {
-      "name": "execution_workspace_repository_roots",
-      "schema": "",
-      "columns": {
-        "id": {
-          "name": "id",
-          "type": "uuid",
-          "primaryKey": true,
-          "notNull": true,
-          "default": "gen_random_uuid()"
-        },
-        "company_id": {
-          "name": "company_id",
-          "type": "uuid",
-          "primaryKey": false,
-          "notNull": true
-        },
-        "canonical_cwd": {
-          "name": "canonical_cwd",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true
-        },
-        "root_key": {
-          "name": "root_key",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true
-        },
-        "mode": {
-          "name": "mode",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true
-        },
-        "created_at": {
-          "name": "created_at",
-          "type": "timestamp with time zone",
-          "primaryKey": false,
-          "notNull": true,
-          "default": "now()"
-        },
-        "updated_at": {
-          "name": "updated_at",
-          "type": "timestamp with time zone",
-          "primaryKey": false,
-          "notNull": true,
-          "default": "now()"
-        }
-      },
-      "indexes": {
-        "execution_workspace_repository_roots_company_root_idx": {
-          "name": "execution_workspace_repository_roots_company_root_idx",
-          "columns": [
-            {
-              "expression": "company_id",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            },
-            {
-              "expression": "root_key",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            }
-          ],
-          "isUnique": true,
-          "concurrently": false,
-          "method": "btree",
-          "with": {}
-        }
-      },
-      "foreignKeys": {
-        "execution_workspace_repository_roots_company_id_companies_id_fk": {
-          "name": "execution_workspace_repository_roots_company_id_companies_id_fk",
-          "tableFrom": "execution_workspace_repository_roots",
-          "tableTo": "companies",
-          "columnsFrom": [
-            "company_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
-          "onDelete": "cascade",
-          "onUpdate": "no action"
-        }
-      },
-      "compositePrimaryKeys": {},
-      "uniqueConstraints": {},
-      "policies": {},
-      "checkConstraints": {},
-      "isRLSEnabled": false
-    },
     "public.execution_workspace_runtime_leases": {
       "name": "execution_workspace_runtime_leases",
       "schema": "",
@@ -30707,6 +30641,34 @@
           ],
           "isUnique": false,
           "where": "\"heartbeat_runs\".\"cost_accounting_pending\" = true",
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "heartbeat_runs_cost_data_quality_idx": {
+          "name": "heartbeat_runs_cost_data_quality_idx",
+          "columns": [
+            {
+              "expression": "company_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "coalesce(\"finished_at\", \"created_at\") desc",
+              "asc": true,
+              "isExpression": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "where": "\"heartbeat_runs\".\"cost_accounting_pending\" = true and \"heartbeat_runs\".\"status\" in ('succeeded','failed','timed_out','cancelled','interrupted')",
           "concurrently": false,
           "method": "btree",
           "with": {}

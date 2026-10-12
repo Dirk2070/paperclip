@@ -1,5 +1,5 @@
 {
-  "id": "64c77972-2c34-4fb7-ba72-f48dadcf794d",
+  "id": "fb1a65b0-7eff-4e5a-a023-fecec51f938c",
   "prevId": "8dadd21e-8c02-4ada-b99a-55ba133e7f70",
   "version": "7",
   "dialect": "postgresql",
@@ -9858,12 +9858,6 @@
           "notNull": true,
           "default": false
         },
-        "execution_defaults": {
-          "name": "execution_defaults",
-          "type": "jsonb",
-          "primaryKey": false,
-          "notNull": false
-        },
         "metadata": {
           "name": "metadata",
           "type": "jsonb",
@@ -10103,12 +10097,6 @@
           "primaryKey": false,
           "notNull": true,
           "default": "''"
-        },
-        "execution_defaults": {
-          "name": "execution_defaults",
-          "type": "jsonb",
-          "primaryKey": false,
-          "notNull": false
         },
         "allow_direct_messages": {
           "name": "allow_direct_messages",
@@ -19637,6 +19625,34 @@
           "method": "btree",
           "with": {}
         },
+        "cost_events_data_quality_idx": {
+          "name": "cost_events_data_quality_idx",
+          "columns": [
+            {
+              "expression": "company_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "occurred_at",
+              "isExpression": false,
+              "asc": false,
+              "nulls": "last"
+            },
+            {
+              "expression": "id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "where": "\"cost_events\".\"billing_type\" = 'unknown' or (\"cost_events\".\"cost_status\" = 'unpriced' and \"cost_events\".\"billing_type\" <> 'subscription_included')",
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
         "cost_events_company_occurred_idx": {
           "name": "cost_events_company_occurred_idx",
           "columns": [
@@ -26242,252 +26258,6 @@
       "checkConstraints": {},
       "isRLSEnabled": false
     },
-    "public.execution_workspace_repositories": {
-      "name": "execution_workspace_repositories",
-      "schema": "",
-      "columns": {
-        "id": {
-          "name": "id",
-          "type": "uuid",
-          "primaryKey": true,
-          "notNull": true,
-          "default": "gen_random_uuid()"
-        },
-        "company_id": {
-          "name": "company_id",
-          "type": "uuid",
-          "primaryKey": false,
-          "notNull": true
-        },
-        "execution_workspace_id": {
-          "name": "execution_workspace_id",
-          "type": "uuid",
-          "primaryKey": false,
-          "notNull": true
-        },
-        "requested_by_issue_id": {
-          "name": "requested_by_issue_id",
-          "type": "uuid",
-          "primaryKey": false,
-          "notNull": false
-        },
-        "repository_identity": {
-          "name": "repository_identity",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true
-        },
-        "catalog_repository_id": {
-          "name": "catalog_repository_id",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false
-        },
-        "repo_url": {
-          "name": "repo_url",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true
-        },
-        "relative_path": {
-          "name": "relative_path",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true
-        },
-        "requested_ref": {
-          "name": "requested_ref",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "default": "'HEAD'"
-        },
-        "pinned_commit": {
-          "name": "pinned_commit",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false
-        },
-        "branch_name": {
-          "name": "branch_name",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false
-        },
-        "request_key": {
-          "name": "request_key",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true
-        },
-        "request_keys": {
-          "name": "request_keys",
-          "type": "jsonb",
-          "primaryKey": false,
-          "notNull": true,
-          "default": "'[]'::jsonb"
-        },
-        "state": {
-          "name": "state",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "default": "'pending'"
-        },
-        "failure_code": {
-          "name": "failure_code",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false
-        },
-        "created_at": {
-          "name": "created_at",
-          "type": "timestamp with time zone",
-          "primaryKey": false,
-          "notNull": true,
-          "default": "now()"
-        },
-        "updated_at": {
-          "name": "updated_at",
-          "type": "timestamp with time zone",
-          "primaryKey": false,
-          "notNull": true,
-          "default": "now()"
-        }
-      },
-      "indexes": {
-        "execution_workspace_repositories_identity_idx": {
-          "name": "execution_workspace_repositories_identity_idx",
-          "columns": [
-            {
-              "expression": "execution_workspace_id",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            },
-            {
-              "expression": "repository_identity",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            }
-          ],
-          "isUnique": true,
-          "concurrently": false,
-          "method": "btree",
-          "with": {}
-        },
-        "execution_workspace_repositories_path_idx": {
-          "name": "execution_workspace_repositories_path_idx",
-          "columns": [
-            {
-              "expression": "execution_workspace_id",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            },
-            {
-              "expression": "relative_path",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            }
-          ],
-          "isUnique": true,
-          "concurrently": false,
-          "method": "btree",
-          "with": {}
-        },
-        "execution_workspace_repositories_request_idx": {
-          "name": "execution_workspace_repositories_request_idx",
-          "columns": [
-            {
-              "expression": "execution_workspace_id",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            },
-            {
-              "expression": "request_key",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            }
-          ],
-          "isUnique": true,
-          "concurrently": false,
-          "method": "btree",
-          "with": {}
-        },
-        "execution_workspace_repositories_company_workspace_idx": {
-          "name": "execution_workspace_repositories_company_workspace_idx",
-          "columns": [
-            {
-              "expression": "company_id",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            },
-            {
-              "expression": "execution_workspace_id",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            }
-          ],
-          "isUnique": false,
-          "concurrently": false,
-          "method": "btree",
-          "with": {}
-        }
-      },
-      "foreignKeys": {
-        "execution_workspace_repositories_company_id_companies_id_fk": {
-          "name": "execution_workspace_repositories_company_id_companies_id_fk",
-          "tableFrom": "execution_workspace_repositories",
-          "tableTo": "companies",
-          "columnsFrom": [
-            "company_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
-          "onDelete": "cascade",
-          "onUpdate": "no action"
-        },
-        "execution_workspace_repositories_execution_workspace_id_execution_workspaces_id_fk": {
-          "name": "execution_workspace_repositories_execution_workspace_id_execution_workspaces_id_fk",
-          "tableFrom": "execution_workspace_repositories",
-          "tableTo": "execution_workspaces",
-          "columnsFrom": [
-            "execution_workspace_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
-          "onDelete": "cascade",
-          "onUpdate": "no action"
-        },
-        "execution_workspace_repositories_requested_by_issue_id_issues_id_fk": {
-          "name": "execution_workspace_repositories_requested_by_issue_id_issues_id_fk",
-          "tableFrom": "execution_workspace_repositories",
-          "tableTo": "issues",
-          "columnsFrom": [
-            "requested_by_issue_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
-          "onDelete": "set null",
-          "onUpdate": "no action"
-        }
-      },
-      "compositePrimaryKeys": {},
-      "uniqueConstraints": {},
-      "policies": {},
-      "checkConstraints": {},
-      "isRLSEnabled": false
-    },
     "public.execution_workspace_runtime_leases": {
       "name": "execution_workspace_runtime_leases",
       "schema": "",
@@ -26743,7 +26513,7 @@
           "name": "project_id",
           "type": "uuid",
           "primaryKey": false,
-          "notNull": false
+          "notNull": true
         },
         "project_workspace_id": {
           "name": "project_workspace_id",
@@ -27021,7 +26791,7 @@
           "columnsTo": [
             "id"
           ],
-          "onDelete": "restrict",
+          "onDelete": "cascade",
           "onUpdate": "no action"
         },
         "execution_workspaces_project_workspace_id_project_workspaces_id_fk": {
@@ -30613,6 +30383,34 @@
           ],
           "isUnique": false,
           "where": "\"heartbeat_runs\".\"cost_accounting_pending\" = true",
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "heartbeat_runs_cost_data_quality_idx": {
+          "name": "heartbeat_runs_cost_data_quality_idx",
+          "columns": [
+            {
+              "expression": "company_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "coalesce(\"finished_at\", \"created_at\") desc",
+              "asc": true,
+              "isExpression": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "where": "\"heartbeat_runs\".\"cost_accounting_pending\" = true and \"heartbeat_runs\".\"status\" in ('succeeded','failed','timed_out','cancelled','interrupted')",
           "concurrently": false,
           "method": "btree",
           "with": {}
@@ -37778,25 +37576,6 @@
         "execution_workspace_id": {
           "name": "execution_workspace_id",
           "type": "uuid",
-          "primaryKey": false,
-          "notNull": false
-        },
-        "workspace_binding_revision": {
-          "name": "workspace_binding_revision",
-          "type": "integer",
-          "primaryKey": false,
-          "notNull": true,
-          "default": 0
-        },
-        "workspace_selection": {
-          "name": "workspace_selection",
-          "type": "jsonb",
-          "primaryKey": false,
-          "notNull": false
-        },
-        "workspace_pending_selection": {
-          "name": "workspace_pending_selection",
-          "type": "jsonb",
           "primaryKey": false,
           "notNull": false
         },
