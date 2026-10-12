@@ -1,0 +1,58 @@
+{
+  "fork_repository": "paperclipai/agent-plugins",
+  "fork_revision": "410257663e0b344df656e604f1601aa1db95f7e4",
+  "fork_path": "vendor/pstack",
+  "upstream_repository": "https://github.com/cursor/plugins",
+  "upstream_revision": "ccb5507cec1546dc88135c1139c811e6c59115ba",
+  "pstack_version": "0.15.15",
+  "files": [
+    {
+      "path": ".agents/skills/create-verification-skill/SKILL.md",
+      "source_path": "skills/create-verification-skill/SKILL.md",
+      "source_sha256": "fb0c07d8b7584510255a70b5d633c20a2a36a38151f6fadcd72ad5ae6d21d672",
+      "sha256": "cad6c9c088891ed2a3eb4f08a5fca71133aa741243f2758a2b60a5f13243c8e4"
+    },
+    {
+      "path": ".agents/skills/create-verification-skill/agents/openai.yaml",
+      "source_path": "skills/create-verification-skill/agents/openai.yaml",
+      "source_sha256": "a1499d95abd8447558c535fe5554adcc3c9b988a0a39264a6283d430effe1e94",
+      "sha256": "a1499d95abd8447558c535fe5554adcc3c9b988a0a39264a6283d430effe1e94"
+    },
+    {
+      "path": ".agents/skills/create-verification-skill/references/feature-map-example/README.md",
+      "source_path": "skills/create-verification-skill/references/feature-map-example/README.md",
+      "source_sha256": "cb7bd782cf89968a4ba3d58a5151db837430db92d19a6f52a906973b77b516ba",
+      "sha256": "cb7bd782cf89968a4ba3d58a5151db837430db92d19a6f52a906973b77b516ba"
+    },
+    {
+      "path": ".agents/skills/create-verification-skill/references/feature-map-example/create-note.md",
+      "source_path": "skills/create-verification-skill/references/feature-map-example/create-note.md",
+      "source_sha256": "644a44c74f35d38c2feb7cd05a0121fdebbb623e8dc376c185b565a581d1ccf7",
+      "sha256": "644a44c74f35d38c2feb7cd05a0121fdebbb623e8dc376c185b565a581d1ccf7"
+    },
+    {
+      "path": ".agents/skills/create-verification-skill/references/feature-map-example/search.md",
+      "source_path": "skills/create-verification-skill/references/feature-map-example/search.md",
+      "source_sha256": "6e87b9e7f2791a7776ba1bb83f371cd285c306c67f19d245cc4dd6ca3015c823",
+      "sha256": "6e87b9e7f2791a7776ba1bb83f371cd285c306c67f19d245cc4dd6ca3015c823"
+    },
+    {
+      "path": ".agents/skills/maintain-verification-skill/SKILL.md",
+      "source_path": "skills/maintain-verification-skill/SKILL.md",
+      "source_sha256": "667adaf0b7e924f657c48ec77394b0cf58f081087c1a5e914c818f4c9fb20ed5",
+      "sha256": "e00e1cee6fb7cf57e7fb995f691ac33e44d015fe67d410b50cdd2ae727e2dfb9"
+    },
+    {
+      "path": ".agents/skills/maintain-verification-skill/agents/openai.yaml",
+      "source_path": "skills/maintain-verification-skill/agents/openai.yaml",
+      "source_sha256": "a1499d95abd8447558c535fe5554adcc3c9b988a0a39264a6283d430effe1e94",
+      "sha256": "a1499d95abd8447558c535fe5554adcc3c9b988a0a39264a6283d430effe1e94"
+    },
+    {
+      "path": ".agents/vendor/pstack-verification/LICENSE",
+      "source_path": "LICENSE",
+      "source_sha256": "bc957ca6bee02792566a1a028d105e02e247c6e77cf057061674273da77b200e",
+      "sha256": "bc957ca6bee02792566a1a028d105e02e247c6e77cf057061674273da77b200e"
+    }
+  ]
+}
