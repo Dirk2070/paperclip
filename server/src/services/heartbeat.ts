@@ -1,4 +1,3 @@
-import { nativeChatWorkspaceCwd } from "./native-runtime/native-chat-workspace.js";
 import { prepareHeartbeatRuntimeServiceIntents, startHeartbeatRuntimeServices, recordHeartbeatAdapterRuntimeServices } from "./heartbeat/runtime-services.js";
 import { prepareHeartbeatExecutionConfiguration } from "./heartbeat/execution-configuration.js";
 import { createHeartbeatRunOutput } from "./heartbeat/run-output.js";
@@ -349,6 +348,7 @@ import {
   resolveHeartbeatNativeRuntimeMode,
 } from "./native-runtime/index.js";
 
+import { nativeChatWorkspaceCwd } from "./native-runtime/native-chat-workspace.js";
 import {
   parseNativeExecutionInput,
   type NativeExecutionInput,
