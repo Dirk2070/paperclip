@@ -19,6 +19,7 @@ assert repo == Path(__file__).resolve().parents[4], 'Launch belongs to another c
 instance = Path(launch['dataDir']) / 'instances/default'
 runtime_file = instance / 'runtime-info.json'
 runtime = json.loads(runtime_file.read_text()) if runtime_file.exists() else None
+pid = None
 if runtime:
     assert runtime['port'] == launch['port'] and runtime['dashboardUrl'] == launch['url']
     pid = runtime['pid']
@@ -37,12 +38,25 @@ if runtime:
         seen.add(ancestor)
         ancestor = int(subprocess.check_output(['ps', '-p', str(ancestor), '-o', 'ppid='], text=True).strip())
     os.kill(pid, signal.SIGTERM)
+def runtime_exited():
+    if pid is None:
+        return True
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    # An exited child can remain a zombie until its launcher reaps it.
+    state = subprocess.run(['ps', '-p', str(pid), '-o', 'stat='],
+                           capture_output=True, text=True)
+    return state.returncode == 0 and state.stdout.strip().startswith('Z')
+
+
 deadline = time.monotonic() + 45
 while time.monotonic() < deadline:
     owners = subprocess.run(['lsof', '-nP', f'-iTCP:{launch["port"]}', '-sTCP:LISTEN', '-t'], capture_output=True, text=True).stdout.split()
-    if not owners and not (instance / 'db/postmaster.pid').exists():
+    if not owners and not (instance / 'db/postmaster.pid').exists() and runtime_exited():
         result = {'status': 'passed', 'port': launch['port'], 'serverStopped': True,
-                  'databaseStopped': True, 'evidenceRetained': sorted(p.name for p in evidence.iterdir())}
+                  'databaseStopped': True, 'runtimeExited': True, 'evidenceRetained': sorted(p.name for p in evidence.iterdir())}
         (evidence / 'cleanup.json').write_text(json.dumps(result, indent=2) + '\n')
         print(f'PASS: owned runtime/database stopped; evidence retained at {evidence}.')
         break

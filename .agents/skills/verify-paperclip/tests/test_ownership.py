@@ -1,5 +1,7 @@
 """Check that verification helpers cannot take ownership of another checkout."""
 import json
+import os
+import time
 from pathlib import Path
 import subprocess
 import sys
@@ -66,6 +68,56 @@ class OwnershipSafety(unittest.TestCase):
                 except subprocess.TimeoutExpired:
                     server.kill()
                     server.communicate()
+
+
+    def test_cleanup_waits_for_exit_after_listener_closes(self):
+        repo = Path(__file__).resolve().parents[4]
+        with tempfile.TemporaryDirectory(prefix='paperclip-delayed-exit-test-') as temp:
+            root = Path(temp)
+            instance = root / 'data/instances/default'
+            instance.mkdir(parents=True)
+            evidence = root / 'evidence'
+            evidence.mkdir()
+            marker = root / 'listener-closed'
+            server = subprocess.Popen(
+                [sys.executable, '-u', '-c',
+                 "import signal, socket, sys, time\n"
+                 "from pathlib import Path\n"
+                 "listener = socket.socket(); listener.bind(('127.0.0.1', 0)); listener.listen()\n"
+                 "def stop(signum, frame):\n"
+                 " listener.close(); Path(sys.argv[1]).write_text('closed')\n"
+                 " time.sleep(2); sys.exit(0)\n"
+                 "signal.signal(signal.SIGTERM, stop)\n"
+                 "print(listener.getsockname()[1], flush=True)\n"
+                 "signal.pause()\n", str(marker)],
+                cwd=repo, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            )
+            try:
+                port = int(server.stdout.readline().strip())
+                url = f'http://127.0.0.1:{port}'
+                (evidence / 'launch.json').write_text(json.dumps({
+                    'repo': str(repo), 'dataDir': str(root / 'data'),
+                    'port': port, 'url': url, 'launcherPid': os.getpid(),
+                }))
+                (instance / 'runtime-info.json').write_text(json.dumps({
+                    'pid': server.pid, 'port': port, 'dashboardUrl': url,
+                }))
+                started = time.monotonic()
+                result = subprocess.run(
+                    [sys.executable, str(repo / '.agents/skills/verify-paperclip/scripts/stop.py'),
+                     '--evidence-dir', str(evidence)],
+                    capture_output=True, text=True, timeout=12,
+                )
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertTrue(marker.exists(), 'Fixture did not close its listener')
+                self.assertGreaterEqual(time.monotonic() - started, 2)
+                self.assertEqual(server.poll(), 0, 'Cleanup returned before runtime exit')
+                cleanup = json.loads((evidence / 'cleanup.json').read_text())
+                self.assertTrue(cleanup['runtimeExited'])
+            finally:
+                if server.poll() is None:
+                    server.kill()
+                server.communicate(timeout=5)
 
 
 if __name__ == '__main__':

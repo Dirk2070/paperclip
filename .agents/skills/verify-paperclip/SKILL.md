@@ -130,8 +130,8 @@ python3 .agents/skills/verify-paperclip/scripts/stop.py \
 ```
 
 The helper verifies the runtime's port, cwd, and launch ancestry before sending
-SIGTERM to that PID, then checks that its HTTP listener and embedded database
-have stopped. Signaling the runtime PID lets the server drain before stopping
+SIGTERM to that PID, then waits for runtime exit and checks that its HTTP
+listener and embedded database have stopped. Signaling the runtime PID lets the server drain before stopping
 PostgreSQL; a terminal group interrupt can reach the database first. Do this after
 failed drives as well as successful runs. If startup fails before a runtime record
 exists, stop only the foreground session you created and inspect its recorded data
@@ -160,5 +160,7 @@ python3 -m unittest discover -s .agents/skills/verify-paperclip/tests -v
 ```
 
 It starts an owned fixture in another temporary checkout and confirms that both
-doctor and stop reject its claimed port/PID without stopping the server. It does
+doctor and stop reject its claimed port/PID without stopping the server. A second
+fixture closes its listener before exiting and proves that cleanup waits for
+runtime exit. These checks do
 not qualify Paperclip startup, database readiness, or onboarding.
