@@ -150,3 +150,15 @@ exist after shutdown. A failed launch leaves its evidence intact.
 All helper invocations are shown above. `launch.py`, `doctor.py`, and `stop.py` use Python's
 standard library and the repo CLI; `onboarding-smoke.mjs` uses the repo's existing
 Playwright dependency. They introduce no new package dependency or test framework.
+
+## Helper safety check
+
+Run the standard-library ownership test before changing launch/doctor/stop helpers:
+
+```sh
+python3 -m unittest discover -s .agents/skills/verify-paperclip/tests -v
+```
+
+It starts an owned fixture in another temporary checkout and confirms that both
+doctor and stop reject its claimed port/PID without stopping the server. It does
+not qualify Paperclip startup, database readiness, or onboarding.
