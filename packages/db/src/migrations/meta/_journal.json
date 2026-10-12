@@ -2329,22 +2329,29 @@
     {
       "idx": 334,
       "version": "7",
-      "when": 1791807201073,
-      "tag": "0334_right_hannibal_king",
+      "when": 1791807836288,
+      "tag": "0334_rare_slipstream",
       "breakpoints": true
     },
     {
       "idx": 335,
       "version": "7",
-      "when": 1791807232294,
-      "tag": "0335_oval_screwball",
+      "when": 1791822880955,
+      "tag": "0335_purple_kate_bishop",
       "breakpoints": true
     },
     {
       "idx": 336,
       "version": "7",
-      "when": 1791809240988,
-      "tag": "0336_chilly_hulk",
+      "when": 1791822901924,
+      "tag": "0336_colorful_kate_bishop",
+      "breakpoints": true
+    },
+    {
+      "idx": 337,
+      "version": "7",
+      "when": 1791822920712,
+      "tag": "0337_rapid_jamie_braddock",
       "breakpoints": true
     }
   ]

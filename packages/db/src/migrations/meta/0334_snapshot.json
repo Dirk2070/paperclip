@@ -1,5 +1,5 @@
 {
-  "id": "a534b058-84e4-42be-a795-143fdd738b37",
+  "id": "39d82f2c-8fd5-4606-84df-f51880dbd6a7",
   "prevId": "fb1a65b0-7eff-4e5a-a023-fecec51f938c",
   "version": "7",
   "dialect": "postgresql",
@@ -9858,12 +9858,6 @@
           "notNull": true,
           "default": false
         },
-        "execution_defaults": {
-          "name": "execution_defaults",
-          "type": "jsonb",
-          "primaryKey": false,
-          "notNull": false
-        },
         "metadata": {
           "name": "metadata",
           "type": "jsonb",
@@ -10103,12 +10097,6 @@
           "primaryKey": false,
           "notNull": true,
           "default": "''"
-        },
-        "execution_defaults": {
-          "name": "execution_defaults",
-          "type": "jsonb",
-          "primaryKey": false,
-          "notNull": false
         },
         "allow_direct_messages": {
           "name": "allow_direct_messages",
@@ -16786,6 +16774,19 @@
           "primaryKey": false,
           "notNull": false
         },
+        "package_mode": {
+          "name": "package_mode",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "'skills'"
+        },
+        "repository_package": {
+          "name": "repository_package",
+          "type": "jsonb",
+          "primaryKey": false,
+          "notNull": false
+        },
         "excluded_folders": {
           "name": "excluded_folders",
           "type": "jsonb",
@@ -17104,6 +17105,87 @@
             "id"
           ],
           "onDelete": "set null",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {},
+      "isRLSEnabled": false
+    },
+    "public.company_skill_repository_snapshots": {
+      "name": "company_skill_repository_snapshots",
+      "schema": "",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "uuid",
+          "primaryKey": true,
+          "notNull": true,
+          "default": "gen_random_uuid()"
+        },
+        "company_id": {
+          "name": "company_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "content_hash": {
+          "name": "content_hash",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "file_inventory": {
+          "name": "file_inventory",
+          "type": "jsonb",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        }
+      },
+      "indexes": {
+        "company_skill_repository_snapshots_content_idx": {
+          "name": "company_skill_repository_snapshots_content_idx",
+          "columns": [
+            {
+              "expression": "company_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "content_hash",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": true,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        }
+      },
+      "foreignKeys": {
+        "company_skill_repository_snapshots_company_id_companies_id_fk": {
+          "name": "company_skill_repository_snapshots_company_id_companies_id_fk",
+          "tableFrom": "company_skill_repository_snapshots",
+          "tableTo": "companies",
+          "columnsFrom": [
+            "company_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "cascade",
           "onUpdate": "no action"
         }
       },
@@ -17967,6 +18049,18 @@
           "primaryKey": false,
           "notNull": true
         },
+        "repository_snapshot_id": {
+          "name": "repository_snapshot_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "repository_skill_path": {
+          "name": "repository_skill_path",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
         "revision_number": {
           "name": "revision_number",
           "type": "integer",
@@ -18121,6 +18215,19 @@
             "id"
           ],
           "onDelete": "cascade",
+          "onUpdate": "no action"
+        },
+        "company_skill_versions_repository_snapshot_id_company_skill_repository_snapshots_id_fk": {
+          "name": "company_skill_versions_repository_snapshot_id_company_skill_repository_snapshots_id_fk",
+          "tableFrom": "company_skill_versions",
+          "tableTo": "company_skill_repository_snapshots",
+          "columnsFrom": [
+            "repository_snapshot_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "restrict",
           "onUpdate": "no action"
         },
         "company_skill_versions_author_agent_id_agents_id_fk": {
@@ -26270,252 +26377,6 @@
       "checkConstraints": {},
       "isRLSEnabled": false
     },
-    "public.execution_workspace_repositories": {
-      "name": "execution_workspace_repositories",
-      "schema": "",
-      "columns": {
-        "id": {
-          "name": "id",
-          "type": "uuid",
-          "primaryKey": true,
-          "notNull": true,
-          "default": "gen_random_uuid()"
-        },
-        "company_id": {
-          "name": "company_id",
-          "type": "uuid",
-          "primaryKey": false,
-          "notNull": true
-        },
-        "execution_workspace_id": {
-          "name": "execution_workspace_id",
-          "type": "uuid",
-          "primaryKey": false,
-          "notNull": true
-        },
-        "requested_by_issue_id": {
-          "name": "requested_by_issue_id",
-          "type": "uuid",
-          "primaryKey": false,
-          "notNull": false
-        },
-        "repository_identity": {
-          "name": "repository_identity",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true
-        },
-        "catalog_repository_id": {
-          "name": "catalog_repository_id",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false
-        },
-        "repo_url": {
-          "name": "repo_url",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true
-        },
-        "relative_path": {
-          "name": "relative_path",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true
-        },
-        "requested_ref": {
-          "name": "requested_ref",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "default": "'HEAD'"
-        },
-        "pinned_commit": {
-          "name": "pinned_commit",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false
-        },
-        "branch_name": {
-          "name": "branch_name",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false
-        },
-        "request_key": {
-          "name": "request_key",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true
-        },
-        "request_keys": {
-          "name": "request_keys",
-          "type": "jsonb",
-          "primaryKey": false,
-          "notNull": true,
-          "default": "'[]'::jsonb"
-        },
-        "state": {
-          "name": "state",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "default": "'pending'"
-        },
-        "failure_code": {
-          "name": "failure_code",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false
-        },
-        "created_at": {
-          "name": "created_at",
-          "type": "timestamp with time zone",
-          "primaryKey": false,
-          "notNull": true,
-          "default": "now()"
-        },
-        "updated_at": {
-          "name": "updated_at",
-          "type": "timestamp with time zone",
-          "primaryKey": false,
-          "notNull": true,
-          "default": "now()"
-        }
-      },
-      "indexes": {
-        "execution_workspace_repositories_identity_idx": {
-          "name": "execution_workspace_repositories_identity_idx",
-          "columns": [
-            {
-              "expression": "execution_workspace_id",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            },
-            {
-              "expression": "repository_identity",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            }
-          ],
-          "isUnique": true,
-          "concurrently": false,
-          "method": "btree",
-          "with": {}
-        },
-        "execution_workspace_repositories_path_idx": {
-          "name": "execution_workspace_repositories_path_idx",
-          "columns": [
-            {
-              "expression": "execution_workspace_id",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            },
-            {
-              "expression": "relative_path",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            }
-          ],
-          "isUnique": true,
-          "concurrently": false,
-          "method": "btree",
-          "with": {}
-        },
-        "execution_workspace_repositories_request_idx": {
-          "name": "execution_workspace_repositories_request_idx",
-          "columns": [
-            {
-              "expression": "execution_workspace_id",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            },
-            {
-              "expression": "request_key",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            }
-          ],
-          "isUnique": true,
-          "concurrently": false,
-          "method": "btree",
-          "with": {}
-        },
-        "execution_workspace_repositories_company_workspace_idx": {
-          "name": "execution_workspace_repositories_company_workspace_idx",
-          "columns": [
-            {
-              "expression": "company_id",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            },
-            {
-              "expression": "execution_workspace_id",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            }
-          ],
-          "isUnique": false,
-          "concurrently": false,
-          "method": "btree",
-          "with": {}
-        }
-      },
-      "foreignKeys": {
-        "execution_workspace_repositories_company_id_companies_id_fk": {
-          "name": "execution_workspace_repositories_company_id_companies_id_fk",
-          "tableFrom": "execution_workspace_repositories",
-          "tableTo": "companies",
-          "columnsFrom": [
-            "company_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
-          "onDelete": "cascade",
-          "onUpdate": "no action"
-        },
-        "execution_workspace_repositories_execution_workspace_id_execution_workspaces_id_fk": {
-          "name": "execution_workspace_repositories_execution_workspace_id_execution_workspaces_id_fk",
-          "tableFrom": "execution_workspace_repositories",
-          "tableTo": "execution_workspaces",
-          "columnsFrom": [
-            "execution_workspace_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
-          "onDelete": "cascade",
-          "onUpdate": "no action"
-        },
-        "execution_workspace_repositories_requested_by_issue_id_issues_id_fk": {
-          "name": "execution_workspace_repositories_requested_by_issue_id_issues_id_fk",
-          "tableFrom": "execution_workspace_repositories",
-          "tableTo": "issues",
-          "columnsFrom": [
-            "requested_by_issue_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
-          "onDelete": "set null",
-          "onUpdate": "no action"
-        }
-      },
-      "compositePrimaryKeys": {},
-      "uniqueConstraints": {},
-      "policies": {},
-      "checkConstraints": {},
-      "isRLSEnabled": false
-    },
     "public.execution_workspace_runtime_leases": {
       "name": "execution_workspace_runtime_leases",
       "schema": "",
@@ -26771,7 +26632,7 @@
           "name": "project_id",
           "type": "uuid",
           "primaryKey": false,
-          "notNull": false
+          "notNull": true
         },
         "project_workspace_id": {
           "name": "project_workspace_id",
@@ -27049,7 +26910,7 @@
           "columnsTo": [
             "id"
           ],
-          "onDelete": "restrict",
+          "onDelete": "cascade",
           "onUpdate": "no action"
         },
         "execution_workspaces_project_workspace_id_project_workspaces_id_fk": {
@@ -37834,25 +37695,6 @@
         "execution_workspace_id": {
           "name": "execution_workspace_id",
           "type": "uuid",
-          "primaryKey": false,
-          "notNull": false
-        },
-        "workspace_binding_revision": {
-          "name": "workspace_binding_revision",
-          "type": "integer",
-          "primaryKey": false,
-          "notNull": true,
-          "default": 0
-        },
-        "workspace_selection": {
-          "name": "workspace_selection",
-          "type": "jsonb",
-          "primaryKey": false,
-          "notNull": false
-        },
-        "workspace_pending_selection": {
-          "name": "workspace_pending_selection",
-          "type": "jsonb",
           "primaryKey": false,
           "notNull": false
         },
