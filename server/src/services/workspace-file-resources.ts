@@ -1,5 +1,6 @@
 import { issueReadSqlCondition, executionWorkspaceReadSqlCondition, projectReadSqlCondition, type AuthorizationActor } from "./authorization.js";
 import fs from "node:fs/promises";
+import { assertExecutionWorkspaceRootReadAccess } from "./execution-workspace-repositories.js";
 import path from "node:path";
 import { and, desc, eq, inArray, isNull } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
@@ -113,6 +114,7 @@ type ExecutionWorkspaceRow = typeof executionWorkspaces.$inferSelect;
 type ProjectWorkspaceRow = typeof projectWorkspaces.$inferSelect;
 
 type WorkspaceCandidate = {
+  companyId: string;
   workspaceKind: WorkspaceFileWorkspaceKind;
   workspaceId: string;
   projectId?: string | null;
@@ -474,6 +476,7 @@ function candidateFromExecutionWorkspace(row: ExecutionWorkspaceRow): WorkspaceC
   const rootPath = row.cwd || row.providerRef || null;
   const remote = !["local_fs", "git_worktree"].includes(provider) || !rootPath || row.status !== "active" || row.closedAt != null;
   return {
+    companyId: row.companyId,
     workspaceKind: "execution_workspace",
     workspaceId: row.id,
     provider,
@@ -491,6 +494,7 @@ function candidateFromProjectWorkspace(
   const rootPath = row.cwd ?? null;
   const remote = !LOCAL_PROJECT_WORKSPACE_SOURCE_TYPES.has(row.sourceType) || !rootPath;
   return {
+    companyId: row.companyId,
     workspaceKind: "project_workspace",
     workspaceId: row.id,
     projectId: project?.id ?? row.projectId,
@@ -1039,7 +1043,7 @@ async function listChangedWorkspaceFiles(input: {
 }
 
 export function workspaceFileResourceService(db: Db, actor?: AuthorizationActor) {
-  async function visibleCandidates(candidates: WorkspaceCandidate[]) {
+  async function visibleCandidates(candidates: WorkspaceCandidate[], skipDeniedSources = false) {
     if (!actor) return candidates;
     const visible: WorkspaceCandidate[] = [];
     for (const candidate of candidates) {
@@ -1049,7 +1053,26 @@ export function workspaceFileResourceService(db: Db, actor?: AuthorizationActor)
         : await db.select({ id: projectWorkspaces.id }).from(projectWorkspaces)
           .innerJoin(projects, eq(projects.id, projectWorkspaces.projectId))
           .where(and(eq(projectWorkspaces.id, candidate.workspaceId), await projectReadSqlCondition(db, actor)));
-      if (rows.length) visible.push(candidate);
+      if (!rows.length) continue;
+      if (candidate.rootPath && (!candidate.remote || candidate.provider === "local_fs" || LOCAL_PROJECT_WORKSPACE_SOURCE_TYPES.has(candidate.provider))) {
+        try {
+          // Pin the physical root used by every subsequent file operation.
+          const canonicalCwd = await fs.realpath(candidate.rootPath);
+          await assertExecutionWorkspaceRootReadAccess(db, {
+            companyId: candidate.companyId, cwd: canonicalCwd, actor,
+            sourceWorkspaceId: candidate.workspaceKind === "execution_workspace" ? candidate.workspaceId : undefined,
+          });
+          candidate.rootPath = canonicalCwd;
+        } catch (error) {
+          if (isHttpStatus(error, 403) || isHttpStatus(error, 404)
+            || ["ENOENT", "ENOTDIR", "EACCES", "EPERM"].includes((error as NodeJS.ErrnoException).code ?? "")) {
+            if (skipDeniedSources) continue;
+            throw notFound("Workspace file not found");
+          }
+          throw error;
+        }
+      }
+      visible.push(candidate);
     }
     return visible;
   }
@@ -1220,7 +1243,7 @@ export function workspaceFileResourceService(db: Db, actor?: AuthorizationActor)
       seen.add(row.workspace.id);
       candidates.push(candidateFromProjectWorkspace(row.workspace, row.project));
     }
-    return visibleCandidates(candidates);
+    return visibleCandidates(candidates, true);
   }
 
   async function discoverUniqueProjectWorkspaceMatch<T>(

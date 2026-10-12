@@ -5,13 +5,13 @@ import fs from "node:fs/promises";
 import { constants as fsConstants } from "node:fs";
 import path from "node:path";
 import { and, eq, isNotNull, or, sql } from "drizzle-orm";
-import { activityLog, agents, heartbeatRuns, projects, executionWorkspaceRepositoryAccess, executionWorkspaceRepositoryRoots, executionWorkspaceRepositories, executionWorkspaces, issues, type Db } from "@paperclipai/db";
+import { activityLog, agents, heartbeatRuns, projects, projectWorkspaces, executionWorkspaceRepositoryAccess, executionWorkspaceRepositoryRoots, executionWorkspaceRepositories, executionWorkspaces, issues, type Db } from "@paperclipai/db";
 import { prepareWorkspaceRepositorySchema, type PrepareWorkspaceRepository, type ProjectRepository } from "@paperclipai/shared";
 import { withDirectoryPublicationLock } from "@paperclipai/adapter-utils/workspace-restore-merge";
 import { conflict, forbidden, notFound } from "../errors.js";
 import { parseNativeExecutionInput } from "../vendor/paperclip-runner/index.js";
-import { assertTaskWorkspaceAccess } from "./task-workspace-source-access.js";
-import { authorizationService, canActorReadExecutionWorkspace, executionWorkspaceReadSqlCondition, issueReadSqlCondition, type AuthorizationActor } from "./authorization.js";
+import { assertTaskWorkspaceAccess, assertTaskWorkspaceSourceProjectAccess } from "./task-workspace-source-access.js";
+import { authorizationService, canActorReadExecutionWorkspace, executionWorkspaceReadSqlCondition, issueReadSqlCondition, projectReadSqlCondition, type AuthorizationActor } from "./authorization.js";
 import { resolveCoreTrustPreset } from "./trust-preset-resolver.js";
 import { captureRunIdentity } from "./run-identity.js";
 import { toolAccessService } from "./tool-access.js";
@@ -94,6 +94,101 @@ export function assertRepositoryRetryMatches(row: Pick<RepositoryRow, "repositor
   }
 }
 
+/** Resolve persisted and physical file provenance without registering readers or policies. */
+async function resolveRepositoryRootSources(tx: Db | DbTransaction, input: {
+  companyId: string; cwd: string; sourceWorkspaceId?: string; inspectCurrentAliases?: boolean;
+}) {
+  const canonicalCwd = await canonicalRepositoryRoot(input.cwd);
+  const rootKey = createHash("sha256").update(canonicalCwd).digest("hex");
+  const entries = await tx.select().from(executionWorkspaceRepositoryAccess).where(and(
+    eq(executionWorkspaceRepositoryAccess.companyId, input.companyId), eq(executionWorkspaceRepositoryAccess.rootKey, rootKey)));
+  if (entries.some(entry => entry.canonicalCwd !== canonicalCwd)) throw forbidden("Repository root identity conflicts with its retained access record");
+  const sourceIds = new Set(entries.filter(entry => entry.kind === "source").map(entry => entry.scopeId));
+  if (input.sourceWorkspaceId) sourceIds.add(input.sourceWorkspaceId);
+  const inspectCurrentAliases = input.inspectCurrentAliases || !entries.some(entry => entry.kind === "reader");
+  if (inspectCurrentAliases) {
+    // Include current physical aliases as well as sticky historical sources.
+    // Ordinary task files carry privacy even without acquisition receipts.
+    const workspaces = await tx.select({ id: executionWorkspaces.id, cwd: executionWorkspaces.cwd }).from(executionWorkspaces)
+      .where(eq(executionWorkspaces.companyId, input.companyId));
+    for (const workspace of workspaces) {
+      if (!workspace.cwd) continue;
+      const peerRoot = await canonicalRepositoryRoot(workspace.cwd).catch((error: NodeJS.ErrnoException) => {
+        if (["ENOTDIR", "EACCES", "EPERM"].includes(error.code ?? "")) return null;
+        throw error;
+      });
+      if (peerRoot === canonicalCwd) sourceIds.add(workspace.id);
+    }
+  }
+  const inventory = await tx.select({ workspaceId: executionWorkspaces.id, cwd: executionWorkspaces.cwd,
+    identity: executionWorkspaceRepositories.repositoryIdentity }).from(executionWorkspaceRepositories)
+    .innerJoin(executionWorkspaces, eq(executionWorkspaces.id, executionWorkspaceRepositories.executionWorkspaceId))
+    .where(and(eq(executionWorkspaceRepositories.companyId, input.companyId), eq(executionWorkspaces.companyId, input.companyId)));
+  const namespace = path.join(canonicalCwd, ".paperclip-repositories");
+  const namespaceEntry = await fs.lstat(namespace).catch((error: NodeJS.ErrnoException) => {
+    if (error.code === "ENOENT") return null;
+    throw error;
+  });
+  const publishedNames = new Set<string>();
+  if (namespaceEntry) {
+    if (!namespaceEntry.isDirectory() || namespaceEntry.isSymbolicLink() || await fs.realpath(namespace) !== namespace) {
+      throw forbidden("Repository namespace has no verifiable contained ownership");
+    }
+    // Configured project siblings have a separate source owner. This child
+    // aggregate owns only task-repo-* publications and their retained provenance.
+    for (const name of await fs.readdir(namespace)) if (name.startsWith("task-repo-")) publishedNames.add(name);
+  }
+  const recognizedNames = new Set<string>();
+  for (const peer of inventory) {
+    const name = path.basename(taskRepositoryRelativePath(peer.identity));
+    const published = publishedNames.has(name);
+    if (!published && !inspectCurrentAliases) continue;
+    const peerRoot = peer.cwd ? await fs.realpath(peer.cwd).catch((error: NodeJS.ErrnoException) => {
+      if (["ENOENT", "ENOTDIR", "EACCES", "EPERM"].includes(error.code ?? "")) return null;
+      throw error;
+    }) : null;
+    // A basename identifies a repository, not its publisher. Independent
+    // copies in available unrelated roots do not contribute files here.
+    // Retained sources survive cwd changes; unavailable legacy aliases with
+    // matching publications remain ambiguous and therefore fail closed.
+    const matches = sourceIds.has(peer.workspaceId) || peerRoot === canonicalCwd
+      || (published && peerRoot === null)
+      || (!entries.some(entry => entry.kind === "reader") && peer.cwd && await legacyRepositoryRootMayMatch(peer.cwd, canonicalCwd));
+    if (matches) {
+      sourceIds.add(peer.workspaceId);
+      if (published) recognizedNames.add(name);
+    }
+  }
+  if ([...publishedNames].some(name => !recognizedNames.has(name))) throw forbidden("Published repository has no retained workspace provenance");
+  return { canonicalCwd, rootKey, entries, sourceIds };
+}
+
+/** File readers share admission's source closure, without changing root policy. */
+export async function assertExecutionWorkspaceRootReadAccess(db: Db | DbTransaction, input: {
+  companyId: string; cwd: string; actor: AuthorizationActor; sourceWorkspaceId?: string;
+}): Promise<void> {
+  const { canonicalCwd, sourceIds } = await resolveRepositoryRootSources(db, { ...input, inspectCurrentAliases: true });
+  for (const sourceId of sourceIds) await assertTaskWorkspaceAccess(db, input.actor, input.companyId, sourceId);
+  // Configured folders can contain project files before any task has an
+  // execution workspace. Read access must include their current aliases too.
+  const configured = await db.select({ projectId: projectWorkspaces.projectId, cwd: projectWorkspaces.cwd })
+    .from(projectWorkspaces).where(eq(projectWorkspaces.companyId, input.companyId));
+  const checkedProjects = new Set<string>();
+  for (const source of configured) {
+    if (!source.cwd || checkedProjects.has(source.projectId)) continue;
+    const sourceRoot = await fs.realpath(source.cwd).catch((error: NodeJS.ErrnoException) => {
+      if (["ENOENT", "ENOTDIR", "EACCES", "EPERM"].includes(error.code ?? "")) return null;
+      throw error;
+    });
+    if (sourceRoot !== canonicalCwd) continue;
+    const [project] = await db.select({ id: projects.id }).from(projects).where(and(
+      eq(projects.id, source.projectId), eq(projects.companyId, input.companyId), await projectReadSqlCondition(db, input.actor)));
+    if (!project) throw forbidden("Workspace source project is no longer accessible");
+    await assertTaskWorkspaceSourceProjectAccess(db, input.actor, input.companyId, source.projectId);
+    checkedProjects.add(source.projectId);
+  }
+}
+
 /** Workspace aggregate child. It owns acquisition receipts, never task binding or provider sessions. */
 export function executionWorkspaceRepositoryService(db: Db) {
   async function catalog(companyId: string, userId: string | null, localTrusted: boolean) {
@@ -172,57 +267,7 @@ export function executionWorkspaceRepositoryService(db: Db) {
   async function authorizeRootAccess(tx: DbTransaction, input: {
     companyId: string; cwd: string; sourceWorkspaceId?: string; reader?: RootReader; actor?: AuthorizationActor; preserveOwnAdmission?: boolean;
   }) {
-    const canonicalCwd = await canonicalRepositoryRoot(input.cwd);
-    const rootKey = createHash("sha256").update(canonicalCwd).digest("hex");
-    const entries = await tx.select().from(executionWorkspaceRepositoryAccess).where(and(
-      eq(executionWorkspaceRepositoryAccess.companyId, input.companyId), eq(executionWorkspaceRepositoryAccess.rootKey, rootKey)));
-    if (entries.some(entry => entry.canonicalCwd !== canonicalCwd)) throw forbidden("Repository root identity conflicts with its retained access record");
-    const sourceIds = new Set(entries.filter(entry => entry.kind === "source").map(entry => entry.scopeId));
-    if (input.sourceWorkspaceId) sourceIds.add(input.sourceWorkspaceId);
-    if (!entries.some(entry => entry.kind === "reader")) {
-      // Bootstrap ordinary task files as well as acquisition receipts. Later
-      // admissions retain their sources here before they can write this root.
-      const workspaces = await tx.select({ id: executionWorkspaces.id, cwd: executionWorkspaces.cwd }).from(executionWorkspaces)
-        .where(eq(executionWorkspaces.companyId, input.companyId));
-      for (const workspace of workspaces) {
-        if (!workspace.cwd) continue;
-        const peerRoot = await canonicalRepositoryRoot(workspace.cwd).catch((error: NodeJS.ErrnoException) => {
-          if (["ENOTDIR", "EACCES", "EPERM"].includes(error.code ?? "")) return null;
-          throw error;
-        });
-        if (peerRoot === canonicalCwd) sourceIds.add(workspace.id);
-      }
-    }
-    const inventory = await tx.select({ workspaceId: executionWorkspaces.id, cwd: executionWorkspaces.cwd,
-      identity: executionWorkspaceRepositories.repositoryIdentity }).from(executionWorkspaceRepositories)
-      .innerJoin(executionWorkspaces, eq(executionWorkspaces.id, executionWorkspaceRepositories.executionWorkspaceId))
-      .where(and(eq(executionWorkspaceRepositories.companyId, input.companyId), eq(executionWorkspaces.companyId, input.companyId)));
-    const namespace = path.join(canonicalCwd, ".paperclip-repositories");
-    const namespaceEntry = await fs.lstat(namespace).catch((error: NodeJS.ErrnoException) => {
-      if (error.code === "ENOENT") return null;
-      throw error;
-    });
-    const publishedNames = new Set<string>();
-    if (namespaceEntry) {
-      if (!namespaceEntry.isDirectory() || namespaceEntry.isSymbolicLink() || await fs.realpath(namespace) !== namespace) {
-        throw forbidden("Repository namespace has no verifiable contained ownership");
-      }
-      // Configured project siblings have a separate source owner. This child
-      // aggregate owns only task-repo-* publications and their retained provenance.
-      for (const name of await fs.readdir(namespace)) if (name.startsWith("task-repo-")) publishedNames.add(name);
-    }
-    const recognizedNames = new Set<string>();
-    for (const peer of inventory) {
-      const name = path.basename(taskRepositoryRelativePath(peer.identity));
-      const published = publishedNames.has(name);
-      if (published) recognizedNames.add(name);
-      // Once a reader was admitted, future sources must be registered through
-      // this fence. Still reconcile physical publications from older versions.
-      if (published || (!entries.some(entry => entry.kind === "reader") && peer.cwd && await legacyRepositoryRootMayMatch(peer.cwd, canonicalCwd))) {
-        sourceIds.add(peer.workspaceId);
-      }
-    }
-    if ([...publishedNames].some(name => !recognizedNames.has(name))) throw forbidden("Published repository has no retained workspace provenance");
+    const { canonicalCwd, rootKey, entries, sourceIds } = await resolveRepositoryRootSources(tx, input);
     const readers = entries.filter(entry => entry.kind === "reader");
     if (input.reader && !readers.some(reader => reader.scopeId === input.reader!.runId)) {
       const [run] = await tx.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.id, input.reader.runId), eq(heartbeatRuns.companyId, input.companyId)));

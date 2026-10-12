@@ -9,7 +9,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest
 import { eq } from "drizzle-orm";
 import { agents, authUsers, companies, companyMemberships, createDb, executionWorkspaceRepositoryRoots, executionWorkspaceRepositoryAccess, executionWorkspaceRepositories, executionWorkspaces,
   heartbeatRuns, issueAccessGrants, issues, projects, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS } from "@paperclipai/db";
-import { executionWorkspaceRepositoryService } from "../services/execution-workspace-repositories.js";
+import { assertExecutionWorkspaceRootReadAccess, executionWorkspaceRepositoryService } from "../services/execution-workspace-repositories.js";
 import { buildNativeExecutionInput } from "../services/native-runtime/native-execution-input.js";
 import { nativeRuntimeContextFixture } from "../services/native-runtime/runtime-context.test-fixture.js";
 import { buildGitAuthInvocation } from "../services/git-credentials.js";
@@ -153,6 +153,35 @@ const support = await getEmbeddedPostgresTestSupport();
       expect(acquisition.materialize).toHaveBeenCalledOnce();
     },
   );
+
+  it.each(["retained", "legacy"] as const)("keeps independent copies of the same repository separate (%s provenance)", async provenance => {
+    const f = await fixture(), peer = await standardPeer(f);
+    const peerCwd = path.join(root, peer.issueId);
+    await mkdir(peerCwd);
+    await db.update(executionWorkspaces).set({ cwd: peerCwd }).where(eq(executionWorkspaces.id, peer.workspace.id));
+    peer.admission.cwd = peerCwd;
+    await privateTask(f);
+    const repository = { kind: "url" as const, url: "https://github.com/public/source" };
+    await f.request(repository);
+    await localPrivateClone(f);
+    const [privateCheckout] = await f.service.prepareForAdmission(f.admission);
+    await f.service.request({ companyId: f.companyId, issueId: peer.issueId, actor: peer.actor,
+      request: { repository, requestKey: randomUUID() } });
+    await localPrivateClone({ ...f, issueId: peer.issueId });
+    const [peerCheckout] = await f.service.prepareForAdmission(peer.admission);
+    expect(peerCheckout.cwd).not.toBe(privateCheckout.cwd);
+    expect(await readFile(path.join(peerCheckout.cwd, "private.txt"), "utf8")).toBe("Private task edits\n");
+    if (provenance === "legacy") await db.delete(executionWorkspaceRepositoryAccess).where(eq(executionWorkspaceRepositoryAccess.companyId, f.companyId));
+    const actual = await vi.importActual<typeof import("../services/managed-repository-checkout.js")>("../services/managed-repository-checkout.js");
+    acquisition.materialize.mockImplementationOnce(actual.materializeManagedProjectWorkspace);
+    await expect(f.service.prepareForAdmission(peer.admission)).resolves.toHaveLength(1);
+    const beforeRead = await db.select().from(executionWorkspaceRepositoryAccess).where(eq(executionWorkspaceRepositoryAccess.companyId, f.companyId));
+    await expect(assertExecutionWorkspaceRootReadAccess(db, { companyId: f.companyId, cwd: peerCwd,
+      sourceWorkspaceId: peer.workspace.id, actor: peer.actor })).resolves.toBeUndefined();
+    await expect(assertExecutionWorkspaceRootReadAccess(db, { companyId: f.companyId, cwd: f.admission.cwd,
+      sourceWorkspaceId: f.workspace.id, actor: peer.actor })).rejects.toThrow(/workspace access|authorization boundary/);
+    expect(await db.select().from(executionWorkspaceRepositoryAccess).where(eq(executionWorkspaceRepositoryAccess.companyId, f.companyId))).toEqual(beforeRead);
+  });
 
   it("rechecks retained own-workspace privacy without adding an empty-admission membership gate", async () => {
     const f = await fixture();

@@ -290,6 +290,10 @@ const support = await getEmbeddedPostgresTestSupport();
           const response = await create(path, selection);
           expect(response.status, JSON.stringify(response.body)).toBe(201);
           expect(response.body.projectId).toBe(selection.inheritExecutionWorkspaceFromIssueId ? f.projectId : null);
+          if (selection.projectWorkspaceId) {
+            expect(response.body.projectWorkspaceId).toBe(selection.projectWorkspaceId);
+            expect(response.body.executionWorkspaceId).toBeNull();
+          }
           expect(response.body.executionPolicy.authorizationPolicy.trustBoundary.projectIds).toEqual([f.projectId]);
         }
       }

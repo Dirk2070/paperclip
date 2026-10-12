@@ -103,6 +103,59 @@ const support = await getEmbeddedPostgresTestSupport();
     }
   });
 
+  it.each([
+    { entryPoint: "create", parentSource: "task_directory" },
+    { entryPoint: "createChild", parentSource: "task_directory" },
+    { entryPoint: "create", parentSource: "configured_source" },
+    { entryPoint: "createChild", parentSource: "configured_source" },
+  ] as const)("honors a child's explicit source through $entryPoint over its parent's $parentSource binding", async ({ entryPoint, parentSource }) => {
+    const f = await fixture(), tasks = issueService(db), workspaces = executionWorkspaceService(db);
+    const [sourceProject] = await db.insert(projects).values({ companyId: f.companyId, name: "Filesystem sources" }).returning();
+    const [parentConfigured, childConfigured] = await db.insert(projectWorkspaces).values([
+      { companyId: f.companyId, projectId: sourceProject.id, name: "Parent files", cwd: `/tmp/parent-${f.issueId}` },
+      { companyId: f.companyId, projectId: sourceProject.id, name: "Child files", cwd: `/tmp/child-${f.issueId}` },
+    ]).returning();
+    if (parentSource === "configured_source") {
+      await db.update(executionWorkspaces).set({ projectId: sourceProject.id, projectWorkspaceId: parentConfigured.id })
+        .where(eq(executionWorkspaces.id, f.workspaceId));
+    }
+    await workspaces.bindTaskWorkspace(f.companyId, f.issueId, f.workspaceId);
+    const parentBefore = await workspaces.inspectTaskWorkspace(f.companyId, f.issueId, f.actor);
+    const input = { title: "Use child-specific files", projectWorkspaceId: childConfigured.id, workspaceSelectionActor: f.actor };
+    const child = entryPoint === "create"
+      ? await tasks.create(f.companyId, { ...input, parentId: f.issueId })
+      : (await tasks.createChild(f.issueId, input)).issue;
+    expect(child).toMatchObject({ parentId: f.issueId, projectId: null, projectWorkspaceId: childConfigured.id,
+      executionWorkspaceId: null, executionWorkspacePreference: null });
+    expect((await workspaces.inspectTaskWorkspace(f.companyId, child.id, f.actor)).workspace).toBeNull();
+    const parentAfter = await workspaces.inspectTaskWorkspace(f.companyId, f.issueId, f.actor);
+    expect(parentAfter.workspace).toEqual(parentBefore.workspace);
+    expect(parentAfter.bindingRevision).toBe(parentBefore.bindingRevision);
+  });
+
+  it.each(["create", "createChild", "strategy_only"] as const)("preserves an explicit null source through %s while applying organizational defaults", async entryPoint => {
+    const f = await fixture(), tasks = issueService(db), workspaces = executionWorkspaceService(db);
+    const [project] = await db.insert(projects).values({ companyId: f.companyId, name: "Organizational defaults" }).returning();
+    const [defaultSource, parentSource] = await db.insert(projectWorkspaces).values([
+      { companyId: f.companyId, projectId: project.id, name: "Default files", cwd: `/tmp/default-${f.issueId}`, isPrimary: true },
+      { companyId: f.companyId, projectId: project.id, name: "Parent files", cwd: `/tmp/parent-${f.issueId}` },
+    ]).returning();
+    await db.update(issues).set({ projectId: project.id }).where(eq(issues.id, f.issueId));
+    await db.update(executionWorkspaces).set({ projectId: project.id, projectWorkspaceId: parentSource.id })
+      .where(eq(executionWorkspaces.id, f.workspaceId));
+    await workspaces.bindTaskWorkspace(f.companyId, f.issueId, f.workspaceId);
+    const input = { title: "Clear parent workspace choice", projectWorkspaceId: null, workspaceSelectionActor: f.actor };
+    const child = entryPoint === "create"
+      ? await tasks.create(f.companyId, { ...input, parentId: f.issueId })
+      : (await tasks.createChild(f.issueId, { ...input,
+          ...(entryPoint === "strategy_only" ? { executionWorkspaceInheritanceMode: "strategy_only" as const } : {}),
+        })).issue;
+    expect(child).toMatchObject({ projectId: project.id, projectWorkspaceId: defaultSource.id,
+      executionWorkspaceId: null, executionWorkspacePreference: null, workspaceSelection: null });
+    expect((await workspaces.inspectTaskWorkspace(f.companyId, f.issueId, f.actor)).workspace)
+      .toMatchObject({ id: f.workspaceId, projectWorkspaceId: parentSource.id });
+  });
+
   it.each(["explicit", "channel", "inherited", "legacy"] as const)("keeps a reused task folder's null source authoritative for %s creation", async (source) => {
     const f = await fixture(), svc = executionWorkspaceService(db), tasks = issueService(db);
     const settings = instanceSettingsService(db), previous = await settings.getExperimental();

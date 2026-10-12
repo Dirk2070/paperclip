@@ -9475,6 +9475,7 @@ export function issueService(db: Db) {
       const childProjectId = issueData.projectId ?? parent.projectId;
       const childInheritsParentProject = childProjectId === parent.projectId;
       const hasExplicitExecutionWorkspaceOverride =
+        issueData.projectWorkspaceId !== undefined ||
         issueData.executionWorkspaceId !== undefined ||
         issueData.executionWorkspacePreference !== undefined ||
         issueData.executionWorkspaceSettings !== undefined;
@@ -9489,10 +9490,11 @@ export function issueService(db: Db) {
         parentId: parent.id,
         projectId: childProjectId,
         projectWorkspaceId:
-          issueData.projectWorkspaceId ??
-          (inheritStrategyOnly && childInheritsParentProject
-            ? parent.projectWorkspaceId
-            : undefined),
+          issueData.projectWorkspaceId !== undefined
+            ? issueData.projectWorkspaceId
+            : (inheritStrategyOnly && childInheritsParentProject
+                ? parent.projectWorkspaceId
+                : undefined),
         goalId: issueData.goalId ?? parent.goalId,
         actorResponsibleUserId: issueData.actorResponsibleUserId ?? null,
         trustExplicitResponsibleUserId:
@@ -10096,6 +10098,7 @@ export function issueService(db: Db) {
             null);
         const hasExplicitExecutionWorkspaceOverride =
           (workspaceSelection !== undefined && workspaceSelectionSource === "explicit") ||
+          issueData.projectWorkspaceId !== undefined ||
           issueData.executionWorkspaceId !== undefined ||
           issueData.executionWorkspacePreference !== undefined ||
           issueData.executionWorkspaceSettings !== undefined;
@@ -10119,6 +10122,7 @@ export function issueService(db: Db) {
             issueData.projectId === workspaceSource.projectId;
           if (
             inheritsSourceProject &&
+            issueData.projectWorkspaceId === undefined &&
             projectWorkspaceId == null &&
             workspaceSource.projectWorkspaceId
           ) {
