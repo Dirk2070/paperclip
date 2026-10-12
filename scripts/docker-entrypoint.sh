@@ -63,24 +63,30 @@ home_dir="${PAPERCLIP_HOME:-/paperclip}"
 ownership_marker="$home_dir/.paperclip-ownership-verified"
 ownership_shallow_depth=3
 
-# Succeeds when any entry is not node:node. The arguments bound the walk
-# (empty for the full tree); -quit stops at the first mismatch.
-ownership_mismatch() {
-    [ -n "$(find "$home_dir" "$@" \( ! -user node -o ! -group node \) -print -quit 2>/dev/null)" ]
+# Sets needs_repair=1 when any entry is not node:node, and probe_failed=1
+# when find exits non-zero (for example, an I/O error), so an incomplete
+# walk is never recorded as verified. The arguments bound the walk (empty
+# for the full tree); -quit stops at the first mismatch.
+probe_ownership() {
+    if ! first_mismatch="$(find "$home_dir" "$@" \( ! -user node -o ! -group node \) -print -quit 2>/dev/null)"; then
+        probe_failed=1
+        log "ownership probe of $home_dir failed; it will run again on the next boot"
+    fi
+    if [ -n "$first_mismatch" ]; then
+        needs_repair=1
+    fi
 }
 
 if [ -d "$home_dir" ]; then
     expected_marker="v1 $(id -u node):$(id -g node)"
     current_marker="$(cat "$ownership_marker" 2>/dev/null || true)"
     needs_repair=0
-    if ownership_mismatch -maxdepth "$ownership_shallow_depth"; then
-        needs_repair=1
-    elif [ "$current_marker" != "$expected_marker" ]; then
+    probe_failed=0
+    probe_ownership -maxdepth "$ownership_shallow_depth"
+    if [ "$needs_repair" -eq 0 ] && [ "$current_marker" != "$expected_marker" ]; then
         log "full ownership probe of $home_dir (no current marker)"
         probe_started=$(date +%s)
-        if ownership_mismatch; then
-            needs_repair=1
-        fi
+        probe_ownership
         log "full ownership probe finished in $(( $(date +%s) - probe_started ))s"
     fi
 
@@ -91,7 +97,10 @@ if [ -d "$home_dir" ]; then
         log "ownership repair finished in $(( $(date +%s) - repair_started ))s"
     fi
 
-    if [ "$current_marker" != "$expected_marker" ]; then
+    # Record the marker only when the tree is known good: a successful
+    # recursive chown (set -e stops the script if it fails), or probes that
+    # all completed without a mismatch.
+    if [ "$current_marker" != "$expected_marker" ] && { [ "$needs_repair" -eq 1 ] || [ "$probe_failed" -eq 0 ]; }; then
         # Write as node so the marker itself never trips the shallow probe
         # (root-squashed network mounts included). Best effort: a read-only
         # home only costs a full probe on the next boot.

@@ -41,6 +41,8 @@ type StubOptions = {
   homeMismatch?: boolean;
   /** Mismatch only below the shallow probe depth: just the full-tree probe finds it. */
   deepMismatch?: boolean;
+  /** The full-tree find exits non-zero without printing a mismatch (e.g. an I/O error). */
+  fullProbeFails?: boolean;
 };
 
 function installStubs(ids: StubOptions) {
@@ -68,7 +70,7 @@ function installStubs(ids: StubOptions) {
     [
       `case " $* " in`,
       `  *" -maxdepth "*) echo "find-shallow $1" >> "${logFile}"; ${ids.homeMismatch ? `echo "$1/mismatched-entry"` : "true"} ;;`,
-      `  *) echo "find-full $1" >> "${logFile}"; ${ids.homeMismatch || ids.deepMismatch ? `echo "$1/deep/mismatched-entry"` : "true"} ;;`,
+      `  *) echo "find-full $1" >> "${logFile}"; ${ids.homeMismatch || ids.deepMismatch ? `echo "$1/deep/mismatched-entry"` : ids.fullProbeFails ? "exit 1" : "true"} ;;`,
       `esac`,
     ].join("\n"),
   );
@@ -208,6 +210,18 @@ describe("docker-entrypoint.sh", () => {
       expect(calls).toContain(`find-full ${stubDir}`);
       expect(calls).not.toContain("chown");
       expect(readFileSync(marker(), "utf8")).toBe("v1 1000:1000\n");
+    });
+
+    it("does not record the marker when the full-tree walk fails without finding a mismatch", async () => {
+      installStubs({ uid: 0, gid: 0, fullProbeFails: true });
+
+      const { stdout, calls } = await runEntrypoint({ PAPERCLIP_HOME: stubDir });
+
+      expect(calls).toContain(`find-full ${stubDir}`);
+      expect(calls).not.toContain("chown");
+      expect(existsSync(marker())).toBe(false);
+      expect(stdout).toContain("failed; it will run again on the next boot");
+      expect(stdout).toContain("ENTRYPOINT-CMD-RAN");
     });
 
     it("repairs a deep mismatch found by the full-tree walk when there is no marker", async () => {
