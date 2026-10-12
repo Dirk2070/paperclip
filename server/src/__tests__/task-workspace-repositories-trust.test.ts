@@ -8,7 +8,7 @@ import path from "node:path";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { eq } from "drizzle-orm";
 import { agents, authUsers, companies, companyMemberships, createDb, executionWorkspaceRepositoryRoots, executionWorkspaceRepositoryAccess, executionWorkspaceRepositories, executionWorkspaces,
-  heartbeatRuns, issueAccessGrants, issues, projects, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS } from "@paperclipai/db";
+  heartbeatRuns, issueAccessGrants, issues, projects, projectWorkspaces, projectAccessMembers, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS } from "@paperclipai/db";
 import { assertExecutionWorkspaceRootReadAccess, executionWorkspaceRepositoryService } from "../services/execution-workspace-repositories.js";
 import { buildNativeExecutionInput } from "../services/native-runtime/native-execution-input.js";
 import { nativeRuntimeContextFixture } from "../services/native-runtime/runtime-context.test-fixture.js";
@@ -154,7 +154,7 @@ const support = await getEmbeddedPostgresTestSupport();
     },
   );
 
-  it.each(["retained", "legacy"] as const)("keeps independent copies of the same repository separate (%s provenance)", async provenance => {
+  it.each(["retained", "legacy", "known_origin_removed"] as const)("keeps independent copies of the same repository separate (%s provenance)", async provenance => {
     const f = await fixture(), peer = await standardPeer(f);
     const peerCwd = path.join(root, peer.issueId);
     await mkdir(peerCwd);
@@ -172,6 +172,7 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(peerCheckout.cwd).not.toBe(privateCheckout.cwd);
     expect(await readFile(path.join(peerCheckout.cwd, "private.txt"), "utf8")).toBe("Private task edits\n");
     if (provenance === "legacy") await db.delete(executionWorkspaceRepositoryAccess).where(eq(executionWorkspaceRepositoryAccess.companyId, f.companyId));
+    if (provenance === "known_origin_removed") await rm(f.admission.cwd, { recursive: true });
     const actual = await vi.importActual<typeof import("../services/managed-repository-checkout.js")>("../services/managed-repository-checkout.js");
     acquisition.materialize.mockImplementationOnce(actual.materializeManagedProjectWorkspace);
     await expect(f.service.prepareForAdmission(peer.admission)).resolves.toHaveLength(1);
@@ -181,6 +182,62 @@ const support = await getEmbeddedPostgresTestSupport();
     await expect(assertExecutionWorkspaceRootReadAccess(db, { companyId: f.companyId, cwd: f.admission.cwd,
       sourceWorkspaceId: f.workspace.id, actor: peer.actor })).rejects.toThrow(/workspace access|authorization boundary/);
     expect(await db.select().from(executionWorkspaceRepositoryAccess).where(eq(executionWorkspaceRepositoryAccess.companyId, f.companyId))).toEqual(beforeRead);
+  });
+
+  it("checks configured private aliases against both admitted agent and responsible user before capture and publication", async () => {
+    const f = await fixture();
+    const alias = path.join(root, `${f.issueId}-configured-alias`);
+    await symlink(f.admission.cwd, alias);
+    const [project] = await db.insert(projects).values({ companyId: f.companyId, name: "Private configured files", visibility: "private" }).returning();
+    const [configured] = await db.insert(projectWorkspaces).values({ companyId: f.companyId, projectId: project.id, name: "Configured alias", cwd: alias }).returning();
+    await writeFile(path.join(f.admission.cwd, "private-configured.txt"), "Private configured project bytes\n");
+    await db.insert(projectAccessMembers).values({ companyId: f.companyId, projectId: project.id, subjectType: "agent", subjectId: f.agentId });
+    await expect(assertExecutionWorkspaceRootReadAccess(db, { companyId: f.companyId, cwd: f.admission.cwd,
+      sourceWorkspaceId: f.workspace.id, actor: f.actor })).rejects.toThrow(/source project/);
+    await expect(f.service.prepareForAdmission(f.admission)).rejects.toThrow(/source project/);
+    expect(await db.select().from(executionWorkspaceRepositoryAccess).where(eq(executionWorkspaceRepositoryAccess.companyId, f.companyId))).toEqual([]);
+    const [grant] = await db.insert(projectAccessMembers).values({ companyId: f.companyId, projectId: project.id,
+      subjectType: "user", subjectId: f.userId }).returning();
+    await expect(f.service.prepareForAdmission(f.admission)).resolves.toEqual([]);
+    await expect(f.service.guardForPublication(f.admission)).resolves.toBeUndefined();
+    const moved = path.join(root, `${f.issueId}-configured-moved`);
+    await mkdir(moved);
+    await db.update(projectWorkspaces).set({ cwd: moved }).where(eq(projectWorkspaces.id, configured.id));
+    await db.delete(projectAccessMembers).where(eq(projectAccessMembers.id, grant.id));
+    await expect(f.service.prepareForAdmission(f.admission)).rejects.toThrow(/source project/);
+    await expect(f.service.guardForPublication(f.admission)).rejects.toThrow(/source project/);
+    await expect(assertExecutionWorkspaceRootReadAccess(db, { companyId: f.companyId, cwd: f.admission.cwd,
+      sourceWorkspaceId: f.workspace.id, actor: f.actor })).rejects.toThrow(/source project/);
+    await db.insert(projectAccessMembers).values({ companyId: f.companyId, projectId: project.id, subjectType: "user", subjectId: f.userId });
+    await expect(f.service.prepareForAdmission(f.admission)).resolves.toEqual([]);
+    await db.delete(projectWorkspaces).where(eq(projectWorkspaces.id, configured.id));
+    await expect(f.service.prepareForAdmission(f.admission)).resolves.toEqual([]);
+    await expect(assertExecutionWorkspaceRootReadAccess(db, { companyId: f.companyId, cwd: f.admission.cwd,
+      sourceWorkspaceId: f.workspace.id, actor: f.actor })).resolves.toBeUndefined();
+    await db.delete(projects).where(eq(projects.id, project.id));
+    await expect(f.service.prepareForAdmission(f.admission)).rejects.toThrow(/source project/);
+    await expect(assertExecutionWorkspaceRootReadAccess(db, { companyId: f.companyId, cwd: f.admission.cwd,
+      sourceWorkspaceId: f.workspace.id, actor: f.actor })).rejects.toThrow(/source project/);
+    expect(acquisition.materialize).not.toHaveBeenCalled();
+  });
+
+  it("retains execution-source project privacy after its workspace project pointer is cleared", async () => {
+    const f = await fixture();
+    const [project] = await db.insert(projects).values({ companyId: f.companyId, name: "Execution source owner", visibility: "private" }).returning();
+    await db.update(executionWorkspaces).set({ projectId: project.id }).where(eq(executionWorkspaces.id, f.workspace.id));
+    await db.insert(projectAccessMembers).values({ companyId: f.companyId, projectId: project.id, subjectType: "agent", subjectId: f.agentId });
+    const [grant] = await db.insert(projectAccessMembers).values({ companyId: f.companyId, projectId: project.id, subjectType: "user", subjectId: f.userId }).returning();
+    await expect(f.service.prepareForAdmission(f.admission)).resolves.toEqual([]);
+    await db.update(executionWorkspaces).set({ projectId: null }).where(eq(executionWorkspaces.id, f.workspace.id));
+    await db.delete(projectAccessMembers).where(eq(projectAccessMembers.id, grant.id));
+    await expect(f.service.prepareForAdmission(f.admission)).rejects.toThrow(/source project/);
+    await expect(assertExecutionWorkspaceRootReadAccess(db, { companyId: f.companyId, cwd: f.admission.cwd,
+      sourceWorkspaceId: f.workspace.id, actor: f.actor })).rejects.toThrow(/source project/);
+    await db.insert(projectAccessMembers).values({ companyId: f.companyId, projectId: project.id, subjectType: "user", subjectId: f.userId });
+    await expect(f.service.prepareForAdmission(f.admission)).resolves.toEqual([]);
+    await db.delete(projects).where(eq(projects.id, project.id));
+    await expect(f.service.prepareForAdmission(f.admission)).rejects.toThrow(/source project/);
+    await expect(f.service.guardForPublication(f.admission)).rejects.toThrow(/source project/);
   });
 
   it("rechecks retained own-workspace privacy without adding an empty-admission membership gate", async () => {
