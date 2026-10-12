@@ -10,6 +10,7 @@ import { eq } from "drizzle-orm";
 import { agents, authUsers, companies, companyMemberships, createDb, executionWorkspaceRepositoryRoots, executionWorkspaceRepositoryAccess, executionWorkspaceRepositories, executionWorkspaces,
   heartbeatRuns, issueAccessGrants, issues, projects, projectWorkspaces, projectAccessMembers, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS } from "@paperclipai/db";
 import { assertExecutionWorkspaceRootReadAccess, executionWorkspaceRepositoryService } from "../services/execution-workspace-repositories.js";
+import { executionWorkspaceService } from "../services/execution-workspaces.js";
 import { buildNativeExecutionInput } from "../services/native-runtime/native-execution-input.js";
 import { nativeRuntimeContextFixture } from "../services/native-runtime/runtime-context.test-fixture.js";
 import { buildGitAuthInvocation } from "../services/git-credentials.js";
@@ -123,7 +124,7 @@ const support = await getEmbeddedPostgresTestSupport();
       beforePublish: async cloneCwd => { await beforePublish?.(); await input.beforePublish(cloneCwd); } }));
   }
 
-  it.each(["empty", "different_identity", "unreadable_alias", "anonymous_private_edits", "authorized_peer"] as const)(
+  it.each(["empty", "different_identity", "unreadable_alias", "loop_alias", "anonymous_private_edits", "authorized_peer"] as const)(
     "authorizes every physical repository source for a standard reader with %s", async scenario => {
       const f = await fixture(), peer = await standardPeer(f);
       if (scenario === "different_identity") await f.service.request({ companyId: f.companyId, issueId: peer.issueId, actor: peer.actor,
@@ -133,15 +134,15 @@ const support = await getEmbeddedPostgresTestSupport();
       await localPrivateClone(f);
       const [prepared] = await f.service.prepareForAdmission(f.admission);
       expect(await readFile(path.join(prepared.cwd, "private.txt"), "utf8")).toBe("Private task edits\n");
-      if (scenario === "unreadable_alias") {
+      if (scenario === "unreadable_alias" || scenario === "loop_alias") {
         const alias = path.join(root, `${f.issueId}-private-alias`);
-        await symlink(f.admission.cwd, alias);
+        await symlink(scenario === "loop_alias" ? alias : f.admission.cwd, alias);
         await db.update(executionWorkspaces).set({ cwd: alias }).where(eq(executionWorkspaces.id, f.workspace.id));
         // Published path evidence must also bootstrap provenance for old rows.
         await db.delete(executionWorkspaceRepositoryAccess).where(eq(executionWorkspaceRepositoryAccess.companyId, f.companyId));
         const actual = fs.realpath.bind(fs);
         vi.spyOn(fs, "realpath").mockImplementation(async pathname => {
-          if (String(pathname) === alias) throw Object.assign(new Error("Private alias unavailable"), { code: "EACCES" });
+          if (scenario === "unreadable_alias" && String(pathname) === alias) throw Object.assign(new Error("Private alias unavailable"), { code: "EACCES" });
           return actual(pathname);
         });
       }
@@ -182,6 +183,31 @@ const support = await getEmbeddedPostgresTestSupport();
     await expect(assertExecutionWorkspaceRootReadAccess(db, { companyId: f.companyId, cwd: f.admission.cwd,
       sourceWorkspaceId: f.workspace.id, actor: peer.actor })).rejects.toThrow(/workspace access|authorization boundary/);
     expect(await db.select().from(executionWorkspaceRepositoryAccess).where(eq(executionWorkspaceRepositoryAccess.companyId, f.companyId))).toEqual(beforeRead);
+  });
+
+  it("preserves legacy private publishers before moving their workspace away from shared files", async () => {
+    const f = await fixture(), peer = await standardPeer(f);
+    const repository = { kind: "url" as const, url: "https://github.com/public/legacy-shared" };
+    await f.service.request({ companyId: f.companyId, issueId: peer.issueId, actor: peer.actor,
+      request: { repository, requestKey: randomUUID() } });
+    await privateTask(f);
+    await f.request(repository);
+    await localPrivateClone(f);
+    const [checkout] = await f.service.prepareForAdmission(f.admission);
+    expect(await readFile(path.join(checkout.cwd, "private.txt"), "utf8")).toBe("Private task edits\n");
+    // Both receipts/files predate provenance registration. The move itself
+    // must preserve the old owner before its available cwd becomes unrelated.
+    await db.delete(executionWorkspaceRepositoryAccess).where(eq(executionWorkspaceRepositoryAccess.companyId, f.companyId));
+    const moved = path.join(root, `${f.issueId}-legacy-moved`);
+    await mkdir(moved);
+    await executionWorkspaceService(db).update(f.workspace.id, { cwd: moved });
+    await expect(assertExecutionWorkspaceRootReadAccess(db, { companyId: f.companyId, cwd: peer.admission.cwd,
+      sourceWorkspaceId: peer.workspace.id, actor: peer.actor })).rejects.toThrow(/workspace access|authorization boundary/);
+    await expect(f.service.prepareForAdmission(peer.admission)).rejects.toThrow(/workspace access|authorization boundary/);
+    const retained = await db.select().from(executionWorkspaceRepositoryAccess).where(eq(executionWorkspaceRepositoryAccess.companyId, f.companyId));
+    expect(retained.some(entry => entry.kind === "source" && entry.scopeId === f.workspace.id)).toBe(true);
+    expect(retained.some(entry => entry.kind === "repository" || entry.kind === "reader")).toBe(false);
+    expect(await readFile(path.join(checkout.cwd, "private.txt"), "utf8")).toBe("Private task edits\n");
   });
 
   it("checks configured private aliases against both admitted agent and responsible user before capture and publication", async () => {
@@ -238,6 +264,37 @@ const support = await getEmbeddedPostgresTestSupport();
     await db.delete(projects).where(eq(projects.id, project.id));
     await expect(f.service.prepareForAdmission(f.admission)).rejects.toThrow(/source project/);
     await expect(f.service.guardForPublication(f.admission)).rejects.toThrow(/source project/);
+  });
+
+  it.each(["configured", "execution"] as const)("ignores an unrelated %s workspace symlink loop", async kind => {
+    const f = await fixture();
+    const loop = path.join(root, `${f.issueId}-unrelated-loop`);
+    await symlink(loop, loop);
+    if (kind === "configured") {
+      const [project] = await db.insert(projects).values({ companyId: f.companyId, name: "Unavailable unrelated project", visibility: "private" }).returning();
+      await db.insert(projectWorkspaces).values({ companyId: f.companyId, projectId: project.id, name: "Loop", cwd: loop });
+    } else {
+      await db.insert(executionWorkspaces).values({ companyId: f.companyId, name: "Unrelated loop", cwd: loop, mode: "isolated_workspace", strategyType: "task_directory" });
+    }
+    await expect(f.service.prepareForAdmission(f.admission)).resolves.toEqual([]);
+    await expect(assertExecutionWorkspaceRootReadAccess(db, { companyId: f.companyId, cwd: f.admission.cwd,
+      sourceWorkspaceId: f.workspace.id, actor: f.actor })).resolves.toBeUndefined();
+  });
+
+  it("rejects an unusable selected root without releasing a retained private source", async () => {
+    const f = await fixture();
+    await privateTask(f);
+    await f.service.prepareForAdmission(f.admission);
+    const peer = await standardPeer(f);
+    const loop = path.join(root, `${f.issueId}-selected-loop`);
+    await symlink(loop, loop);
+    await db.update(executionWorkspaces).set({ cwd: loop }).where(eq(executionWorkspaces.id, f.workspace.id));
+    await expect(f.service.prepareForAdmission({ ...f.admission, cwd: loop })).rejects.toThrow(/ELOOP/);
+    await expect(assertExecutionWorkspaceRootReadAccess(db, { companyId: f.companyId, cwd: loop,
+      sourceWorkspaceId: f.workspace.id, actor: f.actor })).rejects.toThrow(/ELOOP/);
+    await expect(f.service.prepareForAdmission(peer.admission)).rejects.toThrow(/workspace access|authorization boundary/);
+    await expect(assertExecutionWorkspaceRootReadAccess(db, { companyId: f.companyId, cwd: peer.admission.cwd,
+      sourceWorkspaceId: peer.workspace.id, actor: peer.actor })).rejects.toThrow(/workspace access|authorization boundary/);
   });
 
   it("rechecks retained own-workspace privacy without adding an empty-admission membership gate", async () => {

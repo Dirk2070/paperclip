@@ -13,7 +13,7 @@ import request from "supertest";
 import { taskWorkspaceRoutes } from "../routes/task-workspaces.js";
 import { issueRoutes } from "../routes/issues.js";
 import { errorHandler } from "../middleware/error-handler.js";
-import { agents, authUsers, companies, companyMemberships, completionContracts, createDb, environmentLeases, executionWorkspaceRepositories, executionWorkspaces, heartbeatRuns, issues, nativeRunFinalizations, nativeRunResults, workspaceOperations, principalPermissionGrants, projects, projectWorkspaces } from "@paperclipai/db";
+import { agents, authUsers, companies, companyMemberships, completionContracts, createDb, environmentLeases, executionWorkspaceRepositories, executionWorkspaceRepositoryAccess, executionWorkspaces, heartbeatRuns, issues, nativeRunFinalizations, nativeRunResults, workspaceOperations, principalPermissionGrants, projects, projectWorkspaces } from "@paperclipai/db";
 import { executionWorkspaceService } from "../services/execution-workspaces.js";
 import { authorizationService, canActorReadExecutionWorkspace } from "../services/authorization.js";
 import { assertChatExecutionDefaultsAccess } from "../services/chat-execution-defaults.js";
@@ -55,6 +55,68 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(view.bindingRevision).toBe(1);
     const overview = await svc.listOverview(f.companyId, { limit: 20, offset: 0 });
     expect(overview.items).toEqual(expect.arrayContaining([expect.objectContaining({ workspaceId: f.workspaceId, projectId: null })]));
+  });
+
+  it.each(["replace", "clear"] as const)("retains unbound task privacy and old root ownership when an update %ss its source", async action => {
+    const f = await fixture(), service = executionWorkspaceService(db);
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "workspace-update-provenance-"));
+    try {
+      const oldCwd = path.join(root, "old"), newCwd = path.join(root, "new");
+      await fs.mkdir(oldCwd);
+      await fs.mkdir(newCwd);
+      await fs.writeFile(path.join(oldCwd, "private.txt"), "Retained old files");
+      const [project] = await db.insert(projects).values({ companyId: f.companyId, name: "Original source policy" }).returning();
+      const [ancestor, replacement] = await db.insert(issues).values([
+        { companyId: f.companyId, title: "Earlier private source" },
+        { companyId: f.companyId, title: "Replacement task" },
+      ]).returning();
+      // This legacy source has never been bound through bindTaskWorkspace.
+      await db.update(executionWorkspaces).set({ sourceIssueId: ancestor.id })
+        .where(eq(executionWorkspaces.id, f.workspaceId));
+      await db.update(executionWorkspaces).set({ cwd: oldCwd, projectId: project.id, sourceIssueId: f.issueId })
+        .where(eq(executionWorkspaces.id, f.workspaceId));
+      const changed = await service.update(f.workspaceId, { cwd: newCwd, projectId: null,
+        sourceIssueId: action === "replace" ? replacement.id : null,
+        metadata: { label: "replacement metadata", _issuePrivacySources: {} },
+      });
+      expect(changed).toMatchObject({ cwd: newCwd, projectId: null, metadata: {
+        label: "replacement metadata", _issuePrivacySources: { [ancestor.id]: true, [f.issueId]: true },
+      } });
+      const retained = await db.select().from(executionWorkspaceRepositoryAccess)
+        .where(eq(executionWorkspaceRepositoryAccess.companyId, f.companyId));
+      expect(retained.map(entry => ({ kind: entry.kind, scopeId: entry.scopeId, cwd: entry.canonicalCwd })))
+        .toEqual(expect.arrayContaining([
+          { kind: "source", scopeId: f.workspaceId, cwd: await fs.realpath(oldCwd) },
+          { kind: "project_source", scopeId: project.id, cwd: await fs.realpath(oldCwd) },
+        ]));
+      expect(retained.every(entry => ["source", "project_source"].includes(entry.kind))).toBe(true);
+      expect(await fs.readFile(path.join(oldCwd, "private.txt"), "utf8")).toBe("Retained old files");
+      expect(await service.update(f.workspaceId, { metadata: null })).toMatchObject({
+        metadata: { _issuePrivacySources: { [ancestor.id]: true, [f.issueId]: true } },
+      });
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("rolls back a source update when existing root provenance cannot be verified", async () => {
+    const f = await fixture(), service = executionWorkspaceService(db);
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "workspace-update-invalid-root-"));
+    try {
+      const oldCwd = path.join(root, "not-a-directory");
+      await fs.writeFile(oldCwd, "Unverifiable former root");
+      await db.update(executionWorkspaces).set({ cwd: oldCwd, metadata: { label: "original" } })
+        .where(eq(executionWorkspaces.id, f.workspaceId));
+      const [before] = await db.select().from(executionWorkspaces).where(eq(executionWorkspaces.id, f.workspaceId));
+      await expect(service.update(f.workspaceId, { cwd: path.join(root, "new"), sourceIssueId: null, metadata: null }))
+        .rejects.toThrow("Workspace files cannot be detached from unverifiable provenance");
+      const [after] = await db.select().from(executionWorkspaces).where(eq(executionWorkspaces.id, f.workspaceId));
+      expect(after).toEqual(before);
+      expect(await db.select().from(executionWorkspaceRepositoryAccess)
+        .where(eq(executionWorkspaceRepositoryAccess.companyId, f.companyId))).toEqual([]);
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
   });
 
   it.each(["explicit", "channel"] as const)("persists the canonical null binding for a %s task-directory selection", async (source) => {

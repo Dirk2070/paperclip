@@ -3,7 +3,7 @@ import { parseObject } from "../adapters/utils.js";
 import { resolveCoreTrustPreset } from "./trust-preset-resolver.js";
 import { instanceSettingsService } from "./instance-settings.js";
 import { taskWorkspaceSelectableCondition } from "./task-workspace-selection.js";
-import { executionWorkspaceRepositoryService } from "./execution-workspace-repositories.js";
+import { executionWorkspaceRepositoryService, lockExecutionWorkspaceRootProvenance, preserveExecutionWorkspaceRootProvenance } from "./execution-workspace-repositories.js";
 import { forbidden } from "../errors.js";
 import { taskWorkspaceSelectionSchema, type TaskWorkspaceSelection, type TaskWorkspaceIntent } from "@paperclipai/shared";
 import { authorizationService, executionWorkspaceReadSqlCondition, projectReadSqlCondition, issueReadSqlCondition, type AuthorizationActor } from "./authorization.js";
@@ -3189,13 +3189,46 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
     },
 
     update: async (id: string, patch: Partial<typeof executionWorkspaces.$inferInsert>) => {
-      const row = await db
-        .update(executionWorkspaces)
-        .set({ ...patch, updatedAt: new Date() })
-        .where(eq(executionWorkspaces.id, id))
-        .returning()
-        .then((rows) => rows[0] ?? null);
-      return row ? toExecutionWorkspace(row) : null;
+      const sourceKeys = ["cwd", "projectId", "projectWorkspaceId", "sourceIssueId"] as const;
+      if (patch.metadata === undefined && !sourceKeys.some(key => patch[key] !== undefined)) {
+        const row = await db.update(executionWorkspaces).set({ ...patch, updatedAt: new Date() })
+          .where(eq(executionWorkspaces.id, id)).returning().then(rows => rows[0] ?? null);
+        return row ? toExecutionWorkspace(row) : null;
+      }
+      const [identity] = await db.select({ companyId: executionWorkspaces.companyId }).from(executionWorkspaces)
+        .where(eq(executionWorkspaces.id, id));
+      if (!identity) return null;
+      return db.transaction(async tx => {
+        // Repository publication takes the company fence before task/workspace
+        // row locks. Keep that order while retaining the old physical owner.
+        await lockExecutionWorkspaceRootProvenance(tx, identity.companyId);
+        const [current] = await tx.select().from(executionWorkspaces).where(and(
+          eq(executionWorkspaces.id, id), eq(executionWorkspaces.companyId, identity.companyId),
+        )).for("no key update");
+        if (!current) return null;
+        if (sourceKeys.some(key => patch[key] !== undefined && patch[key] !== current[key])) {
+          await preserveExecutionWorkspaceRootProvenance(tx, {
+            companyId: current.companyId, workspaceId: current.id, cwd: current.cwd,
+          });
+        }
+        const nextPatch = { ...patch };
+        const retainedSources = {
+          ...parseObject(parseObject(patch.metadata)._issuePrivacySources),
+          ...parseObject(current.metadata?._issuePrivacySources),
+        };
+        if (patch.sourceIssueId !== undefined && patch.sourceIssueId !== current.sourceIssueId && current.sourceIssueId) {
+          retainedSources[current.sourceIssueId] = true;
+        }
+        if (Object.keys(retainedSources).length > 0) {
+          nextPatch.metadata = {
+            ...(patch.metadata !== undefined ? patch.metadata ?? {} : current.metadata ?? {}),
+            _issuePrivacySources: retainedSources,
+          };
+        }
+        const [row] = await tx.update(executionWorkspaces).set({ ...nextPatch, updatedAt: new Date() })
+          .where(and(eq(executionWorkspaces.id, id), eq(executionWorkspaces.companyId, current.companyId))).returning();
+        return row ? toExecutionWorkspace(row) : null;
+      });
     },
 
     // Reopen one closed isolated execution workspace so an authorized issue can

@@ -1065,7 +1065,7 @@ export function workspaceFileResourceService(db: Db, actor?: AuthorizationActor)
           candidate.rootPath = canonicalCwd;
         } catch (error) {
           if (isHttpStatus(error, 403) || isHttpStatus(error, 404)
-            || ["ENOENT", "ENOTDIR", "EACCES", "EPERM"].includes((error as NodeJS.ErrnoException).code ?? "")) {
+            || ["ENOENT", "ENOTDIR", "EACCES", "EPERM", "ELOOP", "ENAMETOOLONG"].includes((error as NodeJS.ErrnoException).code ?? "")) {
             if (skipDeniedSources) continue;
             throw notFound("Workspace file not found");
           }
@@ -1170,7 +1170,7 @@ export function workspaceFileResourceService(db: Db, actor?: AuthorizationActor)
       }
     }
 
-    return visibleCandidates(candidates);
+    return visibleCandidates(candidates, selector === "auto");
   }
 
   async function loadAvailabilityTargets(
@@ -1210,8 +1210,13 @@ export function workspaceFileResourceService(db: Db, actor?: AuthorizationActor)
           error: unprocessable("Workspace does not belong to the selected project", { code: "workspace_project_mismatch" }),
         });
       } else {
-        const [candidate] = await visibleCandidates([candidateFromProjectWorkspace(workspace, { id: project.id, name: project.name })]);
-        targets.set(targetKey, candidate ? { candidate } : { error: notFound("Project workspace not found") });
+        try {
+          const [candidate] = await visibleCandidates([candidateFromProjectWorkspace(workspace, { id: project.id, name: project.name })]);
+          targets.set(targetKey, candidate ? { candidate } : { error: notFound("Project workspace not found") });
+        } catch (error) {
+          if (!(error instanceof HttpError) || !expectedAvailabilityReason(error)) throw error;
+          targets.set(targetKey, { error });
+        }
       }
     }
     return targets;
@@ -1291,7 +1296,17 @@ export function workspaceFileResourceService(db: Db, actor?: AuthorizationActor)
     const untargetedQueries = queries.filter(
       (item) => !item.unavailableReason && !item.query.projectId && !item.query.workspaceId,
     );
-    const initialCandidates = untargetedQueries.length > 0 ? await listCandidates(issue, "auto") : [];
+    const candidatesBySelector = new Map<WorkspaceFileSelector, WorkspaceCandidate[]>();
+    const selectorErrors = new Map<WorkspaceFileSelector, unknown>();
+    for (const selector of new Set(untargetedQueries.map(item => item.query.workspace))) {
+      try {
+        candidatesBySelector.set(selector, await listCandidates(issue, selector));
+      } catch (error) {
+        if (!expectedAvailabilityReason(error)) throw error;
+        selectorErrors.set(selector, error);
+      }
+    }
+    const initialCandidates = candidatesBySelector.get("auto") ?? [];
     const needsDiscovery = initialCandidates.some((candidate) => !candidate.remote)
       && untargetedQueries.some((item) => item.query.workspace === "auto");
     const discoveryCandidates = needsDiscovery
@@ -1312,13 +1327,10 @@ export function workspaceFileResourceService(db: Db, actor?: AuthorizationActor)
             : null;
           if (explicitTarget?.error) throw explicitTarget.error;
 
+          if (!explicitTarget && selectorErrors.has(item.query.workspace)) throw selectorErrors.get(item.query.workspace);
           const candidates = explicitTarget?.candidate
             ? [explicitTarget.candidate]
-            : initialCandidates.filter((candidate) => {
-                if (item.query.workspace === "execution") return candidate.workspaceKind === "execution_workspace";
-                if (item.query.workspace === "project") return candidate.workspaceKind === "project_workspace";
-                return true;
-              });
+            : candidatesBySelector.get(item.query.workspace) ?? [];
           if (candidates.length === 0) {
             throw unprocessable("No workspace is available for this issue", { code: "no_workspace" });
           }

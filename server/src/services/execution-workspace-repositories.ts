@@ -53,7 +53,7 @@ async function legacyRepositoryRootMayMatch(cwd: string, candidate: string): Pro
       return candidate === unresolved || candidate.startsWith(`${unresolved}${path.sep}`);
     } catch (error) {
       const code = (error as NodeJS.ErrnoException).code;
-      if (!["ENOENT", "ENOTDIR", "EACCES", "EPERM"].includes(code ?? "")) throw error;
+      if (!["ENOENT", "ENOTDIR", "EACCES", "EPERM", "ELOOP", "ENAMETOOLONG"].includes(code ?? "")) throw error;
       if (code === "EACCES" || code === "EPERM") inaccessiblePrefix = probe;
       const parent = path.dirname(probe);
       if (parent === probe) return true;
@@ -114,7 +114,7 @@ async function resolveRepositoryRootSources(tx: Db | DbTransaction, input: {
     for (const workspace of workspaces) {
       if (!workspace.cwd) continue;
       const peerRoot = await canonicalRepositoryRoot(workspace.cwd).catch((error: NodeJS.ErrnoException) => {
-        if (["ENOTDIR", "EACCES", "EPERM"].includes(error.code ?? "")) return null;
+        if (["ENOTDIR", "EACCES", "EPERM", "ELOOP", "ENAMETOOLONG"].includes(error.code ?? "")) return null;
         throw error;
       });
       if (peerRoot === canonicalCwd) sourceIds.add(workspace.id);
@@ -149,7 +149,7 @@ async function resolveRepositoryRootSources(tx: Db | DbTransaction, input: {
     const published = publishedNames.has(name);
     if (!published && !inspectCurrentAliases) continue;
     const peerRoot = peer.cwd ? await fs.realpath(peer.cwd).catch((error: NodeJS.ErrnoException) => {
-      if (["ENOENT", "ENOTDIR", "EACCES", "EPERM"].includes(error.code ?? "")) return null;
+      if (["ENOENT", "ENOTDIR", "EACCES", "EPERM", "ELOOP", "ENAMETOOLONG"].includes(error.code ?? "")) return null;
       throw error;
     }) : null;
     // A basename identifies a repository, not its publisher. Independent
@@ -180,7 +180,7 @@ async function resolveRepositoryRootSources(tx: Db | DbTransaction, input: {
   for (const source of configured) {
     if (!source.cwd || sourceProjectIds.has(source.projectId)) continue;
     const sourceRoot = await fs.realpath(source.cwd).catch((error: NodeJS.ErrnoException) => {
-      if (["ENOENT", "ENOTDIR", "EACCES", "EPERM"].includes(error.code ?? "")) return null;
+      if (["ENOENT", "ENOTDIR", "EACCES", "EPERM", "ELOOP", "ENAMETOOLONG"].includes(error.code ?? "")) return null;
       throw error;
     });
     if (sourceRoot !== canonicalCwd) continue;
@@ -195,6 +195,36 @@ async function assertRootProjectAccess(db: Db | DbTransaction, actor: Authorizat
       eq(projects.id, projectId), eq(projects.companyId, companyId), await projectReadSqlCondition(db, actor)));
     if (!project) throw forbidden("Workspace source project is no longer accessible");
     await assertTaskWorkspaceSourceProjectAccess(db, actor, companyId, projectId);
+  }
+}
+
+export async function lockExecutionWorkspaceRootProvenance(tx: DbTransaction, companyId: string) {
+  // Acquire before task/workspace row locks. Hold only for policy and receipt
+  // transactions, never Git, provider execution, or snapshot capture.
+  await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${`task-repository-roots:${companyId}`}, 0))`);
+}
+
+/** Preserve deny-only owners before a workspace can detach from existing files.
+ * Caller holds the company root fence, followed by the workspace row lock. */
+export async function preserveExecutionWorkspaceRootProvenance(tx: DbTransaction, input: {
+  companyId: string; workspaceId: string; cwd: string | null;
+}): Promise<void> {
+  if (!input.cwd) return;
+  const directory = await fs.stat(input.cwd).catch((error: NodeJS.ErrnoException) => {
+    if (error.code === "ENOENT") return null;
+    throw error;
+  });
+  if (!directory) return;
+  if (!directory.isDirectory()) throw forbidden("Workspace files cannot be detached from unverifiable provenance");
+  const { canonicalCwd, rootKey, entries, sourceIds, sourceProjectIds } = await resolveRepositoryRootSources(tx, {
+    companyId: input.companyId, cwd: input.cwd, sourceWorkspaceId: input.workspaceId, inspectCurrentAliases: true,
+  });
+  for (const [kind, ids] of [["source", sourceIds], ["project_source", sourceProjectIds]] as const) {
+    for (const scopeId of ids) {
+      if (!entries.some(entry => entry.kind === kind && entry.scopeId === scopeId)) {
+        await tx.insert(executionWorkspaceRepositoryAccess).values({ companyId: input.companyId, canonicalCwd, rootKey, kind, scopeId });
+      }
+    }
   }
 }
 
@@ -231,11 +261,6 @@ export function executionWorkspaceRepositoryService(db: Db) {
       run: run ? { companyId: run.companyId, executionPolicy: run.contextSnapshot?.executionPolicy } : null });
     if (trust.kind === "denied") throw forbidden(trust.detail);
     return trust.kind === "low_trust_review";
-  }
-  async function lockRootPolicies(tx: DbTransaction, companyId: string) {
-    // Acquire before task/workspace row locks. Hold only for policy and receipt
-    // transactions, never Git, provider execution, or snapshot capture.
-    await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${`task-repository-roots:${companyId}`}, 0))`);
   }
   async function reserveRootPolicy(tx: DbTransaction, companyId: string, cwd: string, mode: "anonymous_only" | "managed") {
     const canonicalCwd = await canonicalRepositoryRoot(cwd);
@@ -350,13 +375,13 @@ export function executionWorkspaceRepositoryService(db: Db) {
   }
   async function reserveRootAccess(input: Parameters<typeof authorizeRootAccess>[1]) {
     return db.transaction(async tx => {
-      await lockRootPolicies(tx, input.companyId);
+      await lockExecutionWorkspaceRootProvenance(tx, input.companyId);
       await authorizeRootAccess(tx, input);
     });
   }
   async function reserveAdmissionRoot(companyId: string, cwd: string, mode: "anonymous_only" | "managed") {
     return db.transaction(async tx => {
-      await lockRootPolicies(tx, companyId);
+      await lockExecutionWorkspaceRootProvenance(tx, companyId);
       return reserveRootPolicy(tx, companyId, cwd, mode);
     });
   }
@@ -382,7 +407,7 @@ export function executionWorkspaceRepositoryService(db: Db) {
     const available = await catalog(input.companyId, userId, localTrusted);
     const requestedRef = parsed.ref ?? "HEAD";
     const receipt = await db.transaction(async tx => {
-      await lockRootPolicies(tx, input.companyId);
+      await lockExecutionWorkspaceRootProvenance(tx, input.companyId);
       const [issue] = await tx.select().from(issues).where(and(eq(issues.id, input.issueId), eq(issues.companyId, input.companyId), await issueReadSqlCondition(tx, input.actor))).for("no key update");
       if (!issue) throw notFound("Task not found");
       const currentDecision = await authorizationService(tx).decide({ actor: input.actor, action: "issue:mutate", resource: issueResource(issue) });
@@ -432,7 +457,7 @@ export function executionWorkspaceRepositoryService(db: Db) {
   /** Configured-source publication shares this root, but does not acquire a repository. */
   async function guardForPublication(input: { companyId: string; issueId: string; workspaceId: string; cwd: string; agentId: string; runId: string }) {
     await db.transaction(async tx => {
-      await lockRootPolicies(tx, input.companyId);
+      await lockExecutionWorkspaceRootProvenance(tx, input.companyId);
       const [issue] = await tx.select().from(issues).where(and(eq(issues.id, input.issueId), eq(issues.companyId, input.companyId)));
       const [workspace] = await tx.select().from(executionWorkspaces).where(and(eq(executionWorkspaces.id, input.workspaceId), eq(executionWorkspaces.companyId, input.companyId)));
       if (!issue || !workspace || issue.executionWorkspaceId !== workspace.id || !workspace.cwd

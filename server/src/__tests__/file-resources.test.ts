@@ -316,6 +316,56 @@ describeEmbeddedPostgres("workspace file resources", () => {
     expect(resolved.capabilities.preview).toBe(true);
   });
 
+  it.each(["missing", "denied", "symlink loop", "overlong path"])("skips an unused %s configured alternative while keeping explicit reads strict", async alternative => {
+    const { root, projectRoot, executionRoot, targetProjectRoot } = await makeWorkspace();
+    try {
+      const graph = await seedGraph(db, { projectRoot, executionRoot, targetProjectRoot });
+      // Current task files have their own source; the task's organizational
+      // project still contributes a configured alternative to auto lookup.
+      await db.update(executionWorkspaces).set({ projectId: null, projectWorkspaceId: null, providerType: "local_fs" }).where(eq(executionWorkspaces.sourceIssueId, graph.issueId));
+      await fs.writeFile(path.join(executionRoot, "report.txt"), "CURRENT_TASK_REPORT");
+      if (alternative === "missing" || alternative === "symlink loop") {
+        await fs.rm(projectRoot, { recursive: true });
+        if (alternative === "symlink loop") await fs.symlink(projectRoot, projectRoot);
+      } else if (alternative === "overlong path") {
+        await db.update(projectWorkspaces).set({ cwd: path.join(projectRoot, "x".repeat(512)) }).where(eq(projectWorkspaces.id, graph.projectWorkspaceId));
+      } else {
+        const [privateIssue] = await db.insert(issues).values({ companyId: graph.companyId, title: "Private alternative source", visibility: "private", responsibleUserId: "private-owner" }).returning();
+        await db.insert(executionWorkspaces).values({ companyId: graph.companyId, sourceIssueId: privateIssue.id, name: "Private alternative", cwd: projectRoot,
+          mode: "shared_workspace", strategyType: "task_directory", providerType: "local_fs" });
+        await fs.writeFile(path.join(projectRoot, "report.txt"), "PRIVATE_ALTERNATIVE_BYTES");
+      }
+      const app = createApp(db, { type: "board", userId: "board-user", companyIds: [graph.companyId], source: "session", isInstanceAdmin: false });
+      const base = `/api/issues/${graph.issueId}/file-resources`;
+      const listed = await request(app).get(`${base}/list`).expect(200);
+      expect(listed.body.items).toEqual(expect.arrayContaining([expect.objectContaining({ relativePath: "report.txt" })]));
+      await request(app).get(`${base}/resolve`).query({ path: "report.txt" }).expect(200);
+      const preview = await request(app).get(`${base}/content`).query({ path: "report.txt" }).expect(200);
+      expect(preview.body.content.data).toBe("CURRENT_TASK_REPORT");
+      const download = await request(app).get(`${base}/content`).query({ path: "report.txt", download: true }).expect(200);
+      expect(download.text).toBe("CURRENT_TASK_REPORT");
+      const explicit = { projectId: graph.projectId, workspaceId: graph.projectWorkspaceId };
+      for (const target of [explicit, { workspace: "project" }]) {
+        await request(app).get(`${base}/list`).query(target).expect(404);
+        await request(app).get(`${base}/resolve`).query({ ...target, path: "report.txt" }).expect(404);
+        await request(app).get(`${base}/content`).query({ ...target, path: "report.txt" }).expect(404);
+        await request(app).get(`${base}/content`).query({ ...target, path: "report.txt", download: true }).expect(404);
+      }
+      const batch = await request(app).post(`${base}/availability`).send({ queries: [
+        { path: "report.txt" }, { workspace: "execution", path: "report.txt" },
+        { workspace: "project", path: "report.txt" }, { ...explicit, path: "report.txt" },
+      ] }).expect(200);
+      expect(batch.body.results).toEqual([
+        expect.objectContaining({ openable: true, resource: expect.objectContaining({ workspaceKind: "execution_workspace" }) }),
+        expect.objectContaining({ openable: true, resource: expect.objectContaining({ workspaceKind: "execution_workspace" }) }),
+        expect.objectContaining({ openable: false, unavailableReason: "not_found", resource: null }),
+        expect.objectContaining({ openable: false, unavailableReason: "not_found", resource: null }),
+      ]);
+      expect(JSON.stringify(batch.body)).not.toContain(projectRoot);
+      expect(JSON.stringify(batch.body)).not.toContain("PRIVATE_ALTERNATIVE_BYTES");
+    } finally { await fs.rm(root, { recursive: true, force: true }); }
+  });
+
   it("reads projectless task files before and after organizational project assignment", async () => {
     const { projectRoot, executionRoot } = await makeWorkspace();
     const graph = await seedGraph(db, { projectRoot, executionRoot });
@@ -357,7 +407,10 @@ describeEmbeddedPostgres("workspace file resources", () => {
       const deny = async () => {
         for (const pending of reads()) {
           const response = await pending;
-          expect(response.status).toBe(404);
+          if (response.body.kind === "workspace_file_availability") {
+            expect(response.status).toBe(200);
+            expect(response.body.results).toEqual([expect.objectContaining({ openable: false, unavailableReason: "not_found", resource: null })]);
+          } else expect(response.status).toBe(404);
           for (const hidden of ["PRIVATE_ROOT_BYTES", source.id, privateIssueId, executionRoot, "Private source workspace"]) expect(JSON.stringify(response.body)).not.toContain(hidden);
         }
       };
