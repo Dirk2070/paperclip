@@ -8,7 +8,7 @@ import path from "node:path";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { eq } from "drizzle-orm";
 import { agents, authUsers, companies, companyMemberships, createDb, executionWorkspaceRepositoryRoots, executionWorkspaceRepositoryAccess, executionWorkspaceRepositories, executionWorkspaces,
-  heartbeatRuns, issueAccessGrants, issues, projects, projectWorkspaces, projectAccessMembers, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS } from "@paperclipai/db";
+  heartbeatRuns, issueAccessGrants, issues, projects, projectWorkspaces, projectAccessMembers, principalPermissionGrants, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS } from "@paperclipai/db";
 import { assertExecutionWorkspaceRootReadAccess, executionWorkspaceRepositoryService } from "../services/execution-workspace-repositories.js";
 import { executionWorkspaceService } from "../services/execution-workspaces.js";
 import { buildNativeExecutionInput } from "../services/native-runtime/native-execution-input.js";
@@ -226,6 +226,94 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(retained.some(entry => entry.kind === "project_source" && entry.scopeId === project.id)).toBe(true);
     expect(retained.some(entry => entry.kind === "repository" || entry.kind === "reader")).toBe(false);
     expect(await readFile(path.join(checkout.cwd, "private.txt"), "utf8")).toBe("Private task edits\n");
+  });
+
+  it("requires the admitted actor's write grant for a projectless alias of a protected configured root", async () => {
+    const f = await fixture();
+    await db.update(companyMemberships).set({ membershipRole: "member" }).where(eq(companyMemberships.principalId, f.userId));
+    const [project] = await db.insert(projects).values({ companyId: f.companyId, name: "Protected shared root",
+      executionWorkspacePolicy: { authorizationPolicy: { assignmentPolicy: { mode: "protected" } } } }).returning();
+    const alias = path.join(root, `${f.issueId}-protected-alias`);
+    await symlink(f.admission.cwd, alias);
+    const [source] = await db.insert(projectWorkspaces).values({ companyId: f.companyId, projectId: project.id, name: "Protected source", cwd: alias }).returning();
+    const read = () => assertExecutionWorkspaceRootReadAccess(db, { companyId: f.companyId, cwd: f.admission.cwd,
+      sourceWorkspaceId: f.workspace.id, actor: f.actor });
+    await expect(read()).resolves.toBeUndefined();
+    await expect(f.service.prepareForAdmission(f.admission)).rejects.toThrow(/protected|not authorized/);
+    await expect(f.request({ kind: "url", url: "https://github.com/public/writable" })).rejects.toThrow(/protected|not authorized/);
+    await db.insert(principalPermissionGrants).values({ companyId: f.companyId, principalType: "agent", principalId: f.agentId,
+      permissionKey: "tasks:assign_scope", scope: { projectId: project.id, assigneeAgentId: f.agentId } });
+    await expect(f.service.prepareForAdmission(f.admission)).rejects.toThrow(/Responsible user.*not authorized/);
+    const [grant] = await db.insert(principalPermissionGrants).values({ companyId: f.companyId, principalType: "user", principalId: f.userId,
+      permissionKey: "tasks:assign_scope", scope: { projectId: project.id, assigneeAgentId: f.agentId } }).returning();
+    await expect(f.service.prepareForAdmission(f.admission)).resolves.toEqual([]);
+    await expect(f.service.guardForPublication(f.admission)).resolves.toBeUndefined();
+    await db.delete(projectWorkspaces).where(eq(projectWorkspaces.id, source.id));
+    await db.delete(principalPermissionGrants).where(eq(principalPermissionGrants.id, grant.id));
+    await expect(read()).resolves.toBeUndefined();
+    await expect(f.service.prepareForAdmission(f.admission)).rejects.toThrow(/Responsible user.*not authorized/);
+    await expect(f.service.guardForPublication(f.admission)).rejects.toThrow(/Responsible user.*not authorized/);
+  });
+
+  it("keeps genuine isolated Git copies read-only against their protected source project", async () => {
+    const f = await fixture();
+    const sourceRoot = path.join(root, `${f.issueId}-isolated-source`);
+    await mkdir(sourceRoot);
+    const exec = promisify(execFileCallback);
+    await exec("git", ["init", "--initial-branch=main", sourceRoot]);
+    await writeFile(path.join(sourceRoot, "README.md"), "Protected source\n");
+    await exec("git", ["-C", sourceRoot, "add", "."]);
+    await exec("git", ["-C", sourceRoot, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.test", "commit", "-m", "source"]);
+    await exec("git", ["-C", sourceRoot, "worktree", "add", "-b", "isolated-task", f.admission.cwd]);
+    const [project] = await db.insert(projects).values({ companyId: f.companyId, name: "Protected copy source",
+      executionWorkspacePolicy: { authorizationPolicy: { assignmentPolicy: { mode: "protected" } } } }).returning();
+    const [source] = await db.insert(projectWorkspaces).values({ companyId: f.companyId, projectId: project.id, name: "Original", cwd: sourceRoot }).returning();
+    await db.update(executionWorkspaces).set({ projectId: project.id, projectWorkspaceId: source.id, strategyType: "git_worktree" }).where(eq(executionWorkspaces.id, f.workspace.id));
+    await expect(f.service.prepareForAdmission(f.admission)).resolves.toEqual([]);
+    await expect(f.service.prepareForAdmission(f.admission)).resolves.toEqual([]);
+    await expect(f.service.guardForPublication(f.admission)).resolves.toBeUndefined();
+    // Physical configured ownership overrides a misleading isolation label.
+    await db.update(projectWorkspaces).set({ cwd: f.admission.cwd }).where(eq(projectWorkspaces.id, source.id));
+    await expect(f.service.prepareForAdmission(f.admission)).rejects.toThrow(/protected|not authorized/);
+  });
+
+  it.each(["move", "delete"] as const)("retains protected shared execution-source write scope after %s", async change => {
+    const f = await fixture(), source = await standardPeer(f);
+    const [project] = await db.insert(projects).values({ companyId: f.companyId, name: "Protected execution owner",
+      executionWorkspacePolicy: { authorizationPolicy: { assignmentPolicy: { mode: "protected" } } } }).returning();
+    await db.update(executionWorkspaces).set({ projectId: project.id }).where(eq(executionWorkspaces.id, source.workspace.id));
+    await expect(f.service.prepareForAdmission(f.admission)).rejects.toThrow(/protected|not authorized/);
+    const grants = await db.insert(principalPermissionGrants).values([
+      { companyId: f.companyId, principalType: "agent", principalId: f.agentId, permissionKey: "tasks:assign_scope", scope: { projectId: project.id, assigneeAgentId: f.agentId } },
+      { companyId: f.companyId, principalType: "user", principalId: f.userId, permissionKey: "tasks:assign_scope", scope: { projectId: project.id, assigneeAgentId: f.agentId } },
+    ]).returning();
+    await expect(f.service.prepareForAdmission(f.admission)).resolves.toEqual([]);
+    if (change === "move") {
+      const moved = path.join(root, `${source.issueId}-shared-moved`);
+      await mkdir(moved);
+      await executionWorkspaceService(db).update(source.workspace.id, { cwd: moved, projectId: null });
+    } else await db.delete(executionWorkspaces).where(eq(executionWorkspaces.id, source.workspace.id));
+    for (const grant of grants) await db.delete(principalPermissionGrants).where(eq(principalPermissionGrants.id, grant.id));
+    await expect(f.service.prepareForAdmission(f.admission)).rejects.toThrow(/protected|not authorized|workspace access/);
+  });
+
+  it("does not require historical readers to retain write grants for another authorized writer", async () => {
+    const f = await fixture(), peer = await standardPeer(f);
+    const [project] = await db.insert(projects).values({ companyId: f.companyId, name: "Shared source writers",
+      executionWorkspacePolicy: { authorizationPolicy: { assignmentPolicy: { mode: "protected" } } } }).returning();
+    await db.insert(projectWorkspaces).values({ companyId: f.companyId, projectId: project.id, name: "Shared", cwd: f.admission.cwd });
+    const prior = await db.insert(principalPermissionGrants).values([
+      { companyId: f.companyId, principalType: "agent", principalId: f.agentId, permissionKey: "tasks:assign_scope", scope: { projectId: project.id, assigneeAgentId: f.agentId } },
+      { companyId: f.companyId, principalType: "user", principalId: f.userId, permissionKey: "tasks:assign_scope", scope: { projectId: project.id, assigneeAgentId: f.agentId } },
+    ]).returning();
+    await f.service.prepareForAdmission(f.admission);
+    await db.insert(principalPermissionGrants).values([
+      { companyId: f.companyId, principalType: "agent", principalId: peer.agentId, permissionKey: "tasks:assign_scope", scope: { projectId: project.id, assigneeAgentId: peer.agentId } },
+      { companyId: f.companyId, principalType: "user", principalId: peer.userId, permissionKey: "tasks:assign_scope", scope: { projectId: project.id, assigneeAgentId: peer.agentId } },
+    ]);
+    for (const grant of prior) await db.delete(principalPermissionGrants).where(eq(principalPermissionGrants.id, grant.id));
+    await expect(f.service.prepareForAdmission(peer.admission)).resolves.toEqual([]);
+    await expect(f.service.guardForPublication(peer.admission)).resolves.toBeUndefined();
   });
 
   it("checks configured private aliases against both admitted agent and responsible user before capture and publication", async () => {

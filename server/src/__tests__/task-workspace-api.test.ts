@@ -3,7 +3,7 @@ import { mkdtemp } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { eq } from "drizzle-orm";
-import { agents, executionWorkspaceRepositories, executionWorkspaces, issues, heartbeatRuns } from "@paperclipai/db";
+import { agents, executionWorkspaceRepositories, executionWorkspaces, issues, heartbeatRuns, projects, projectWorkspaces, principalPermissionGrants, companyMemberships } from "@paperclipai/db";
 import { startRunnerApiTestServer } from "./helpers/runner-api-server.js";
 import { getEmbeddedPostgresTestSupport } from "./helpers/embedded-postgres.js";
 import { PaperclipRunnerToolAuthority } from "../services/native-runtime/paperclip-runner-tool-authority.js";
@@ -33,6 +33,30 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(runs).toHaveLength(1);
     expect(runs[0]).toMatchObject({ id: f.runId, status: "running" });
   });
+  it("keeps projectless protected-folder aliases readable while enforcing scoped write grants", async () => {
+    const f = await server.fixture({ conversation: true, disableWakeOnDemand: true });
+    const [project] = await server.db.insert(projects).values({ companyId: f.companyId, name: "Protected physical source",
+      executionWorkspacePolicy: { authorizationPolicy: { assignmentPolicy: { mode: "protected" } } } }).returning();
+    await server.db.insert(projectWorkspaces).values({ companyId: f.companyId, projectId: project.id, name: "Protected folder", cwd: f.workspace });
+    const [workspace] = await server.db.insert(executionWorkspaces).values({ companyId: f.companyId, sourceIssueId: f.issueId,
+      name: "Projectless alias", cwd: f.workspace, mode: "shared_workspace", strategyType: "task_directory" }).returning();
+    await server.db.update(issues).set({ projectId: null, projectWorkspaceId: null, executionWorkspaceId: workspace.id }).where(eq(issues.id, f.issueId));
+    const call = (tool: string, args: Record<string, unknown>) => f.authority.execute({ tool, arguments: args, callId: randomUUID() });
+    const selection = { selection: { kind: "existing", workspaceId: workspace.id }, expectedBindingRevision: 0, requestKey: "protected-alias" };
+    const repository = { repository: { kind: "url", url: "https://github.com/public/example" }, requestKey: "protected-root-write" };
+    await expect(call("get_workspace", {})).resolves.toMatchObject({ workspace: { id: workspace.id, projectId: null } });
+    await expect(call("select_workspace", selection)).rejects.toThrow(/protected|not authorized/);
+    await expect(call("prepare_repository", repository)).rejects.toThrow(/protected|not authorized/);
+    await server.db.insert(companyMemberships).values({ companyId: f.companyId, principalType: "agent", principalId: f.agentId,
+      membershipRole: "member", status: "active" });
+    await server.db.insert(principalPermissionGrants).values([
+      { companyId: f.companyId, principalType: "agent", principalId: f.agentId, permissionKey: "tasks:assign_scope", scope: { projectId: project.id, assigneeAgentId: f.agentId } },
+      { companyId: f.companyId, principalType: "user", principalId: f.userId!, permissionKey: "tasks:assign_scope", scope: { projectId: project.id, assigneeAgentId: f.agentId } },
+    ]);
+    await expect(call("select_workspace", selection)).resolves.toMatchObject({ kind: "scheduled" });
+    await expect(call("prepare_repository", repository)).resolves.toMatchObject({ kind: "requires_next_admission" });
+  });
+
   it("does not expose repository preparation or workspace selection to Ask mode", async () => {
     const f = await server.fixture({ mode: "ask", conversation: true, disableWakeOnDemand: true });
     await expect(f.authority.execute({ tool: "prepare_repository", callId: randomUUID(), arguments: { repository: { kind: "url", url: "https://github.com/public/example" }, requestKey: "denied" } })).rejects.toThrow();
@@ -88,7 +112,7 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(await server.db.select().from(executionWorkspaceRepositories).where(eq(executionWorkspaceRepositories.companyId, f.companyId))).toHaveLength(0);
     await server.db.update(agents).set({ permissions: policy([f.projectId]) }).where(eq(agents.id, f.agentId));
     await expect(call("get_workspace", {})).resolves.toMatchObject({ workspace: { id: source.id, projectId: f.projectId } });
-    await expect(call("select_workspace", { selection: { kind: "existing", workspaceId: source.id }, expectedBindingRevision: 0, requestKey: "source-allowed" })).resolves.toMatchObject({ kind: "scheduled" });
+    await expect(call("select_workspace", { selection: { kind: "existing", workspaceId: source.id }, expectedBindingRevision: 0, requestKey: "source-allowed" })).rejects.toThrow(/outside.*boundary/i);
     // Project permission cannot expose the unrelated task's files through a
     // shared physical root. Give that fixture its own folder before testing
     // the permitted source-only preparation path.
@@ -96,6 +120,7 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(await server.db.select().from(executionWorkspaceRepositories).where(eq(executionWorkspaceRepositories.companyId, f.companyId))).toHaveLength(0);
     const unrelatedCwd = await mkdtemp(join(dirname(f.workspace), "unrelated-workspace-"));
     await server.db.update(executionWorkspaces).set({ cwd: unrelatedCwd }).where(eq(executionWorkspaces.id, unrelated.id));
+    await expect(call("select_workspace", { selection: { kind: "existing", workspaceId: source.id }, expectedBindingRevision: 0, requestKey: "source-allowed" })).resolves.toMatchObject({ kind: "scheduled" });
     await expect(call("prepare_repository", repository)).resolves.toMatchObject({ kind: "requires_next_admission" });
     expect((await server.db.select().from(issues).where(eq(issues.id, f.issueId)))[0]?.projectId).toBeNull();
   });

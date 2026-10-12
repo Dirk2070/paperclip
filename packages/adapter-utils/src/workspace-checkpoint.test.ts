@@ -276,3 +276,123 @@ it("uses sparse native transfer end-to-end, including replay and unsupported-run
   expect(await fs.readdir(cache)).toEqual(saturated);
   await recovered.cleanupWorkspaceSnapshot();
 }, 30000);
+
+async function exportFailureFixture(failure: "low_disk" | "full_root" | "full_special" | "digest" | "path" | "symlink") {
+  const { prepareSandboxManagedRuntime } = await import("./sandbox-managed-runtime.js");
+  const { DatabaseSync } = await import("node:sqlite");
+  const f = await fixture();
+  await disposeDirectorySnapshot(f.baseline);
+  const remote = path.join(f.temp, "remote"), outside = path.join(f.temp, "outside");
+  await fs.writeFile(outside, "private");
+  const metrics: unknown[] = [];
+  const counts = { captures: 0, fullExports: 0, capacityFailures: 0 };
+  const run = async (command: string) => {
+    const capture = command.includes("checkpoint.mjs");
+    if (capture) counts.captures++;
+    try { await execute("sh", ["-c", command]); }
+    catch (error) {
+      if (capture && ["low_disk", "full_root", "full_special"].includes(failure)) {
+        expect(String(error)).toContain("Workspace checkpoint storage is below its free-space reserve");
+        counts.capacityFailures++;
+        await expect(fs.stat(path.join(f.root, "new"))).rejects.toMatchObject({ code: "ENOENT" });
+      }
+      throw error;
+    }
+  };
+  const sync = async (operations: import("./sandbox-managed-runtime.js").SandboxSyncOperation[]) => {
+    for (const operation of operations) {
+      for (const file of operation.files) {
+        if (file.sourcePath === remote) {
+          counts.fullExports++;
+          if (failure === "full_root") {
+            await fs.rm(file.targetPath, { recursive: true, force: true });
+            await fs.symlink(remote, file.targetPath);
+            continue;
+          }
+        }
+        await fs.mkdir(path.dirname(file.targetPath), { recursive: true });
+        await fs.cp(file.sourcePath, file.targetPath, { recursive: true, verbatimSymlinks: true,
+          filter: source => !file.exclude?.some(exclude => path.relative(file.sourcePath, source) === exclude) });
+        if (file.sourcePath === remote && failure === "full_special") await execute("mkfifo", [path.join(file.targetPath, "unsafe-pipe")]);
+        if (["low_disk", "full_root", "full_special"].includes(failure) && file.targetPath.endsWith("/checkpoint.mjs")) {
+          const script = await fs.readFile(file.targetPath, "utf8");
+          // Execute the real capture helper against a provider filesystem whose
+          // reported remaining space is below the optional SQLite reserve.
+          await fs.writeFile(file.targetPath, script.replace("const __name", "fs.statfs = async () => ({ bavail: 128n * 1024n, bsize: 1024n });\nconst __name"));
+        }
+        if (file.sourcePath.endsWith("/output")) {
+          if (failure === "digest") await fs.writeFile(path.join(file.targetPath, "payload", "new"), "forged");
+          else if (failure === "path" || failure === "symlink") {
+            const manifest = new DatabaseSync(path.join(file.targetPath, "manifest.sqlite"));
+            try {
+              manifest.prepare("INSERT INTO records VALUES('baseline',?,?)").run(
+                failure === "path" ? "../escape" : "escape",
+                JSON.stringify({ kind: "symlink", target: outside }),
+              );
+            } finally { manifest.close(); }
+          }
+        }
+      }
+      for (const command of operation.postUploadCommands ?? []) await run(command.command);
+    }
+    return { operations: operations.map(op => ({ operationId: op.operationId, filesTransferred: 0, bytesTransferred: 0 })) };
+  };
+  const client = { makeDir: (dir: string) => fs.mkdir(dir, { recursive: true }).then(() => {}),
+    writeFile: (file: string, data: ArrayBuffer) => fs.writeFile(file, Buffer.from(data)), readFile: (file: string) => fs.readFile(file),
+    listFiles: (dir: string) => fs.readdir(dir), remove: (file: string) => fs.rm(file, { force: true, recursive: true }), run,
+    syncIn: sync, syncOut: sync };
+  const prepare = (overrides: Partial<Parameters<typeof prepareSandboxManagedRuntime>[0]> = {}) => prepareSandboxManagedRuntime({
+    spec: { provider: "test", sandboxId: "test", remoteCwd: remote, timeoutMs: 30000, apiKey: null, transport: "sandbox" },
+    adapterKey: "test", client, workspaceLocalDir: f.root, workspaceCheckpoint: true,
+    onWorkspaceCheckpoint: async metric => { metrics.push(metric); }, ...overrides,
+  });
+  const prepared = await prepare();
+  await fs.writeFile(path.join(remote, "new"), "tiny export");
+  await fs.unlink(path.join(remote, "deleted"));
+  return { ...f, remote, outside, prepared, prepare, metrics, counts };
+}
+
+it.each([false, true])("falls back once to a full tiny export below the sparse disk reserve (recovery=%s)", async recovery => {
+  const f = await exportFailureFixture("low_disk");
+  const snapshot = f.prepared.workspaceSyncSnapshot!;
+  const runtime = recovery ? await f.prepare({ workspaceInboundMode: "adopt_remote", workspaceBaseline: snapshot.baseline,
+    workspaceGitSnapshot: snapshot.gitSnapshot, workspaceRepositories: snapshot.repositories }) : f.prepared;
+  await fs.writeFile(path.join(f.root, "host-only"), "concurrent host edit");
+  await fs.symlink(f.outside, path.join(f.remote, "unsafe-link"));
+  await fs.symlink("../outside", path.join(f.remote, "escaping-link"));
+  await fs.symlink("new", path.join(f.remote, "safe-link"));
+  await runtime.restoreWorkspace();
+  expect(f.counts).toEqual({ captures: 1, fullExports: 1, capacityFailures: 1 });
+  expect(f.metrics).toEqual([{ mode: "full", scannedEntries: null, changedFiles: null, payloadBytes: null }]);
+  expect(await fs.readFile(path.join(f.root, "new"), "utf8")).toBe("tiny export");
+  expect(await fs.readFile(path.join(f.root, "host-only"), "utf8")).toBe("concurrent host edit");
+  await expect(fs.stat(path.join(f.root, "deleted"))).rejects.toMatchObject({ code: "ENOENT" });
+  expect(await fs.readFile(f.outside, "utf8")).toBe("private");
+  for (const name of ["unsafe-link", "escaping-link"]) {
+    await expect(fs.lstat(path.join(f.root, name))).rejects.toMatchObject({ code: "ENOENT" });
+  }
+  expect(await fs.readlink(path.join(f.root, "safe-link"))).toBe("new");
+  await runtime.cleanupWorkspaceSnapshot();
+  if (recovery) await f.prepared.cleanupWorkspaceSnapshot();
+}, 30000);
+
+it.each(["digest", "path", "symlink"] as const)("never falls back after returned sparse %s validation fails", async attack => {
+  const f = await exportFailureFixture(attack);
+  await expect(f.prepared.restoreWorkspace()).rejects.toThrow();
+  expect(f.counts.fullExports).toBe(0);
+  expect(f.metrics).toEqual([]);
+  await expect(fs.stat(path.join(f.root, "new"))).rejects.toMatchObject({ code: "ENOENT" });
+  expect(await fs.readFile(path.join(f.root, "deleted"), "utf8")).toBe("delete me");
+  expect(await fs.readFile(f.outside, "utf8")).toBe("private");
+  await f.prepared.cleanupWorkspaceSnapshot();
+}, 30000);
+
+it.each(["full_root", "full_special"] as const)("rejects unsafe %s data before host writes after capacity fallback", async attack => {
+  const f = await exportFailureFixture(attack);
+  await expect(f.prepared.restoreWorkspace()).rejects.toThrow("Unsafe workspace export directory");
+  expect(f.counts).toEqual({ captures: 1, fullExports: 1, capacityFailures: 1 });
+  await expect(fs.stat(path.join(f.root, "new"))).rejects.toMatchObject({ code: "ENOENT" });
+  expect(await fs.readFile(path.join(f.root, "deleted"), "utf8")).toBe("delete me");
+  expect(await fs.readFile(f.outside, "utf8")).toBe("private");
+  await f.prepared.cleanupWorkspaceSnapshot();
+}, 30000);

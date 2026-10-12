@@ -89,7 +89,7 @@ const support = await getEmbeddedPostgresTestSupport();
           { kind: "source", scopeId: f.workspaceId, cwd: await fs.realpath(oldCwd) },
           { kind: "project_source", scopeId: project.id, cwd: await fs.realpath(oldCwd) },
         ]));
-      expect(retained.every(entry => ["source", "project_source"].includes(entry.kind))).toBe(true);
+      expect(retained.every(entry => ["source", "project_source", "shared_project_source"].includes(entry.kind))).toBe(true);
       expect(await fs.readFile(path.join(oldCwd, "private.txt"), "utf8")).toBe("Retained old files");
       expect(await service.update(f.workspaceId, { metadata: null })).toMatchObject({
         metadata: { _issuePrivacySources: { [ancestor.id]: true, [f.issueId]: true } },

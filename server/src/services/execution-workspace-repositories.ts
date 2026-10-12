@@ -172,29 +172,44 @@ async function resolveRepositoryRootSources(tx: Db | DbTransaction, input: {
   // Retain the privacy owner, not its disposable workspace configuration.
   // Execution sources may later lose their project FK; retained files must not.
   const sourceProjectIds = new Set(entries.filter(entry => entry.kind === "project_source").map(entry => entry.scopeId));
+  const sharedProjectIds = new Set(entries.filter(entry => entry.kind === "shared_project_source").map(entry => entry.scopeId));
+  const isolatedProjectIds = new Set<string>();
   if (sourceIds.size) {
-    const owners = await tx.select({ projectId: executionWorkspaces.projectId }).from(executionWorkspaces).where(and(
+    const owners = await tx.select({ projectId: executionWorkspaces.projectId, strategyType: executionWorkspaces.strategyType }).from(executionWorkspaces).where(and(
       eq(executionWorkspaces.companyId, input.companyId), or(...[...sourceIds].map(id => eq(executionWorkspaces.id, id)))));
-    for (const owner of owners) if (owner.projectId) sourceProjectIds.add(owner.projectId);
+    for (const owner of owners) if (owner.projectId) {
+      sourceProjectIds.add(owner.projectId);
+      if (owner.strategyType === "git_worktree") isolatedProjectIds.add(owner.projectId);
+      else sharedProjectIds.add(owner.projectId);
+    }
   }
   for (const source of configured) {
-    if (!source.cwd || sourceProjectIds.has(source.projectId)) continue;
+    if (!source.cwd || sharedProjectIds.has(source.projectId)) continue;
     const sourceRoot = await fs.realpath(source.cwd).catch((error: NodeJS.ErrnoException) => {
       if (["ENOENT", "ENOTDIR", "EACCES", "EPERM", "ELOOP", "ENAMETOOLONG"].includes(error.code ?? "")) return null;
       throw error;
     });
     if (sourceRoot !== canonicalCwd) continue;
     sourceProjectIds.add(source.projectId);
+    sharedProjectIds.add(source.projectId);
   }
-  return { canonicalCwd, rootKey, entries, sourceIds, sourceProjectIds };
+  // Older retained owners have no sharing classification. Require writes
+  // unless an authoritative retained workspace proves an isolated copy.
+  for (const entry of entries) if (entry.kind === "project_source" && !isolatedProjectIds.has(entry.scopeId)) {
+    sharedProjectIds.add(entry.scopeId);
+  }
+  return { canonicalCwd, rootKey, entries, sourceIds, sourceProjectIds, sharedProjectIds };
 }
 
-async function assertRootProjectAccess(db: Db | DbTransaction, actor: AuthorizationActor, companyId: string, projectIds: Set<string>) {
+async function assertRootProjectAccess(db: Db | DbTransaction, actor: AuthorizationActor, companyId: string, projectIds: Set<string>,
+  write?: { sharedProjectIds: Set<string> } & Omit<NonNullable<Parameters<typeof assertTaskWorkspaceSourceProjectAccess>[4]>, "write">) {
   for (const projectId of projectIds) {
     const [project] = await db.select({ id: projects.id }).from(projects).where(and(
       eq(projects.id, projectId), eq(projects.companyId, companyId), await projectReadSqlCondition(db, actor)));
     if (!project) throw forbidden("Workspace source project is no longer accessible");
-    await assertTaskWorkspaceSourceProjectAccess(db, actor, companyId, projectId);
+    await assertTaskWorkspaceSourceProjectAccess(db, actor, companyId, projectId, {
+      ...write, write: write?.sharedProjectIds.has(projectId),
+    });
   }
 }
 
@@ -216,10 +231,10 @@ export async function preserveExecutionWorkspaceRootProvenance(tx: DbTransaction
   });
   if (!directory) return;
   if (!directory.isDirectory()) throw forbidden("Workspace files cannot be detached from unverifiable provenance");
-  const { canonicalCwd, rootKey, entries, sourceIds, sourceProjectIds } = await resolveRepositoryRootSources(tx, {
+  const { canonicalCwd, rootKey, entries, sourceIds, sourceProjectIds, sharedProjectIds } = await resolveRepositoryRootSources(tx, {
     companyId: input.companyId, cwd: input.cwd, sourceWorkspaceId: input.workspaceId, inspectCurrentAliases: true,
   });
-  for (const [kind, ids] of [["source", sourceIds], ["project_source", sourceProjectIds]] as const) {
+  for (const [kind, ids] of [["source", sourceIds], ["project_source", sourceProjectIds], ["shared_project_source", sharedProjectIds]] as const) {
     for (const scopeId of ids) {
       if (!entries.some(entry => entry.kind === kind && entry.scopeId === scopeId)) {
         await tx.insert(executionWorkspaceRepositoryAccess).values({ companyId: input.companyId, canonicalCwd, rootKey, kind, scopeId });
@@ -235,6 +250,15 @@ export async function assertExecutionWorkspaceRootReadAccess(db: Db | DbTransact
   const { sourceIds, sourceProjectIds } = await resolveRepositoryRootSources(db, { ...input, inspectCurrentAliases: true });
   for (const sourceId of sourceIds) await assertTaskWorkspaceAccess(db, input.actor, input.companyId, sourceId);
   await assertRootProjectAccess(db, input.actor, input.companyId, sourceProjectIds);
+}
+
+/** Selection validates writable source scope without registering a reader or changing policy. */
+export async function assertExecutionWorkspaceRootWriteAccess(db: Db | DbTransaction, input: {
+  companyId: string; cwd: string; actor: AuthorizationActor; sourceWorkspaceId: string;
+} & Omit<NonNullable<Parameters<typeof assertTaskWorkspaceSourceProjectAccess>[4]>, "write">): Promise<void> {
+  const { sourceIds, sourceProjectIds, sharedProjectIds } = await resolveRepositoryRootSources(db, { ...input, inspectCurrentAliases: true });
+  for (const sourceId of sourceIds) await assertTaskWorkspaceAccess(db, input.actor, input.companyId, sourceId);
+  await assertRootProjectAccess(db, input.actor, input.companyId, sourceProjectIds, { ...input, sharedProjectIds });
 }
 
 /** Workspace aggregate child. It owns acquisition receipts, never task binding or provider sessions. */
@@ -308,9 +332,9 @@ export function executionWorkspaceRepositoryService(db: Db) {
   }
   type RootReader = { runId: string; issueId: string; agentId: string };
   async function authorizeRootAccess(tx: DbTransaction, input: {
-    companyId: string; cwd: string; sourceWorkspaceId?: string; reader?: RootReader; actor?: AuthorizationActor; preserveOwnAdmission?: boolean;
+    companyId: string; cwd: string; sourceWorkspaceId?: string; reader?: RootReader; actor?: AuthorizationActor; issueId?: string; preserveOwnAdmission?: boolean;
   }) {
-    const { canonicalCwd, rootKey, entries, sourceIds, sourceProjectIds } = await resolveRepositoryRootSources(tx, input);
+    const { canonicalCwd, rootKey, entries, sourceIds, sourceProjectIds, sharedProjectIds } = await resolveRepositoryRootSources(tx, input);
     const readers = entries.filter(entry => entry.kind === "reader");
     if (input.reader && !readers.some(reader => reader.scopeId === input.reader!.runId)) {
       const [run] = await tx.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.id, input.reader.runId), eq(heartbeatRuns.companyId, input.companyId)));
@@ -333,7 +357,8 @@ export function executionWorkspaceRepositoryService(db: Db) {
       }
       const actor: AuthorizationActor = { type: "agent", source: "agent_jwt", companyId: input.companyId,
         agentId: reader.agentId!, runId: reader.scopeId, onBehalfOfUserId: reader.responsibleUserId === "local-board" ? null : reader.responsibleUserId };
-      await assertRootProjectAccess(tx, actor, input.companyId, sourceProjectIds);
+      await assertRootProjectAccess(tx, actor, input.companyId, sourceProjectIds,
+        input.reader?.runId === reader.scopeId ? { sharedProjectIds, issueId: issue.id } : undefined);
       if (ownAdmissionOnly) {
         const [ownSource] = await tx.select({ id: executionWorkspaces.id }).from(executionWorkspaces).where(and(
           eq(executionWorkspaces.companyId, input.companyId), eq(executionWorkspaces.id, input.sourceWorkspaceId!),
@@ -356,7 +381,8 @@ export function executionWorkspaceRepositoryService(db: Db) {
       }
     }
     if (input.actor) {
-      await assertRootProjectAccess(tx, input.actor, input.companyId, sourceProjectIds);
+      if (!input.issueId) throw forbidden("Workspace write authorization requires a task");
+      await assertRootProjectAccess(tx, input.actor, input.companyId, sourceProjectIds, { sharedProjectIds, issueId: input.issueId });
       for (const sourceId of sourceIds) await assertTaskWorkspaceAccess(tx, input.actor, input.companyId, sourceId);
     }
     for (const sourceId of sourceIds) {
@@ -367,6 +393,11 @@ export function executionWorkspaceRepositoryService(db: Db) {
     for (const sourceId of sourceProjectIds) {
       if (!entries.some(entry => entry.kind === "project_source" && entry.scopeId === sourceId)) {
         await tx.insert(executionWorkspaceRepositoryAccess).values({ companyId: input.companyId, rootKey, canonicalCwd, kind: "project_source", scopeId: sourceId });
+      }
+    }
+    for (const sourceId of sharedProjectIds) {
+      if (!entries.some(entry => entry.kind === "shared_project_source" && entry.scopeId === sourceId)) {
+        await tx.insert(executionWorkspaceRepositoryAccess).values({ companyId: input.companyId, rootKey, canonicalCwd, kind: "shared_project_source", scopeId: sourceId });
       }
     }
     for (const reader of readers) {
@@ -427,7 +458,7 @@ export function executionWorkspaceRepositoryService(db: Db) {
         await reserveRootPolicy(tx, input.companyId, workspace.cwd, anonymousOnly ? "anonymous_only" : "managed");
       }
       if (!workspace.cwd) throw conflict("The task workspace has no directory for repository preparation");
-      await authorizeRootAccess(tx, { companyId: input.companyId, cwd: workspace.cwd, sourceWorkspaceId: workspace.id, actor: input.actor });
+      await authorizeRootAccess(tx, { companyId: input.companyId, cwd: workspace.cwd, sourceWorkspaceId: workspace.id, actor: input.actor, issueId: input.issueId });
       const existing = await tx.select().from(executionWorkspaceRepositories).where(and(eq(executionWorkspaceRepositories.executionWorkspaceId, workspace.id), or(eq(executionWorkspaceRepositories.repositoryIdentity, source.repositoryIdentity), sql`${executionWorkspaceRepositories.requestKeys} ? ${parsed.requestKey}`)));
       for (const row of existing) {
         assertAcquisitionReceipt(row, anonymousOnly);

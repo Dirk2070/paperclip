@@ -7,7 +7,7 @@ export const executionWorkspaceRepositoryAccess = pgTable("execution_workspace_r
   companyId: uuid("company_id").notNull().references(() => companies.id, { onDelete: "cascade" }),
   rootKey: text("root_key").notNull(),
   canonicalCwd: text("canonical_cwd").notNull(),
-  kind: text("kind").$type<"source" | "reader" | "project_source" | "repository">().notNull(),
+  kind: text("kind").$type<"source" | "reader" | "project_source" | "shared_project_source" | "repository">().notNull(),
   scopeId: uuid("scope_id").notNull(),
   issueId: uuid("issue_id"),
   agentId: uuid("agent_id"),

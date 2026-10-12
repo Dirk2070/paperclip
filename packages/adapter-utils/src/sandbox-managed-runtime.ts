@@ -368,6 +368,16 @@ function isWorkspaceGitScanSaturatedError(error: unknown): boolean {
   );
 }
 
+// Remote command transports may preserve only stderr, not the original error
+// code. This is used only for capture-command failures, never returned data.
+function isCheckpointCaptureCapacityError(error: unknown): boolean {
+  if (!error || typeof error !== "object") return false;
+  const failure = error as { code?: unknown; message?: unknown; stderr?: unknown };
+  if (["ENOSPC", "EDQUOT", "SQLITE_FULL"].includes(String(failure.code))) return true;
+  const diagnostic = [failure.message, failure.stderr].filter(value => typeof value === "string").join("\n");
+  return /Workspace checkpoint storage is below its free-space reserve|\b(?:ENOSPC|EDQUOT|SQLITE_FULL)\b|database or disk is full/i.test(diagnostic);
+}
+
 /**
  * Resolve a referenced project's Git-ignored paths ONCE, before any staging
  * site runs. Called once per project (see `execute.ts`); the sandbox lane,
@@ -906,6 +916,31 @@ async function* walkDirectory(root: string, relative = "", childrenFirst = false
     if (entry.isDirectory()) yield* walkDirectory(root, nextRelative, childrenFirst);
     if (childrenFirst) yield nextRelative;
   }
+}
+
+// Native providers validate their own transfers, but full-export confinement
+// must also hold for the returned host tree before baseline merge can write.
+async function confineFullWorkspaceExport(root: string): Promise<void> {
+  const unsafe = () => Object.assign(new Error("Unsafe workspace export directory"), { code: "WORKSPACE_RESTORE_UNSAFE_ARCHIVE" });
+  if (!(await fs.lstat(root)).isDirectory()) throw unsafe();
+  const canonicalRoot = await fs.realpath(root);
+  const walk = async (directory: string): Promise<void> => {
+    if (await fs.realpath(directory) !== directory) throw unsafe();
+    for await (const entry of await fs.opendir(directory)) {
+      const entryPath = path.join(directory, entry.name);
+      const stats = await fs.lstat(entryPath);
+      if (stats.isDirectory()) await walk(entryPath);
+      else if (stats.isSymbolicLink()) {
+        const target = await fs.readlink(entryPath);
+        const resolved = path.resolve(directory, target);
+        // Match sparse capture: omit unsafe links, preserving unrelated bytes.
+        if (path.isAbsolute(target) || (resolved !== canonicalRoot && !resolved.startsWith(`${canonicalRoot}${path.sep}`))) {
+          await fs.unlink(entryPath);
+        }
+      } else if (!stats.isFile()) throw unsafe();
+    }
+  };
+  await walk(canonicalRoot);
 }
 
 async function copyWorkspaceEntry(sourceRoot: string, targetRoot: string, relative: string): Promise<void> {
@@ -2010,7 +2045,6 @@ export async function prepareSandboxManagedRuntime(input: {
                     { timeoutMs: 15_000 },
                   ).then(() => true, () => false);
                 }
-                if (input.workspaceCheckpoint && !sparseSupported) await input.onWorkspaceCheckpoint?.({ mode: "full", scannedEntries: null, changedFiles: null, payloadBytes: null }).catch(() => undefined);
                 if (sparseSupported) {
                   const checkpointBaseline = repositories.length === 0 ? baselineSnapshot! : await selectDirectorySnapshot(baselineSnapshot!, {
                     omit: repositories.map((repo) => repo.path), exclude: workspaceRestoreExclude, ignoredPaths,
@@ -2031,23 +2065,36 @@ export async function prepareSandboxManagedRuntime(input: {
                     assertSyncOperationsConfined(inbound, { sourceRoots: [tempDir], targetRoots: [runtimeRootDir] });
                     await input.client.syncIn!(inbound);
                     try {
-                      await input.client.run(["node", remoteHelper, workspaceRemoteDir, remoteManifest, remoteOutput, JSON.stringify(workspaceRestoreExclude)].map(shellQuote).join(" "), { timeoutMs: input.spec.timeoutMs });
-                      const output = path.join(tempDir, "checkpoint");
-                      const outbound: SandboxSyncOperation[] = [{ operationId: nextSyncOperationId(), files: [
-                        { sourcePath: remoteOutput, targetPath: output, kind: "directory" },
-                      ] }];
-                      assertSyncOperationsConfined(outbound, { sourceRoots: [runtimeRootDir], targetRoots: [tempDir] });
-                      await withWorkspaceRestoreStep("workspace_transfer", () => input.client.syncOut!(outbound));
-                      checkpointSnapshot = readCheckpointSnapshot(path.join(output, "manifest.sqlite"), checkpointBaseline);
-                      await fs.rename(path.join(output, "payload"), extractedDir);
-                      const metrics = await validateCheckpointPayload({ baseline: checkpointBaseline, snapshot: checkpointSnapshot, payload: extractedDir });
-                      await input.onWorkspaceCheckpoint?.(metrics).catch(() => undefined);
+                      let captured = false;
+                      try {
+                        await input.client.run(["node", remoteHelper, workspaceRemoteDir, remoteManifest, remoteOutput, JSON.stringify(workspaceRestoreExclude)].map(shellQuote).join(" "), { timeoutMs: input.spec.timeoutMs });
+                        captured = true;
+                      } catch (error) {
+                        // A sparse capture needs extra remote disk for its manifest
+                        // and payload. Full transfer needs neither; it still passes
+                        // the normal confinement and baseline-merge validation.
+                        if (!isCheckpointCaptureCapacityError(error)) throw error;
+                      }
+                      if (captured) {
+                        const output = path.join(tempDir, "checkpoint");
+                        const outbound: SandboxSyncOperation[] = [{ operationId: nextSyncOperationId(), files: [
+                          { sourcePath: remoteOutput, targetPath: output, kind: "directory" },
+                        ] }];
+                        assertSyncOperationsConfined(outbound, { sourceRoots: [runtimeRootDir], targetRoots: [tempDir] });
+                        await withWorkspaceRestoreStep("workspace_transfer", () => input.client.syncOut!(outbound));
+                        checkpointSnapshot = readCheckpointSnapshot(path.join(output, "manifest.sqlite"), checkpointBaseline);
+                        await fs.rename(path.join(output, "payload"), extractedDir);
+                        const metrics = await validateCheckpointPayload({ baseline: checkpointBaseline, snapshot: checkpointSnapshot, payload: extractedDir });
+                        await input.onWorkspaceCheckpoint?.(metrics).catch(() => undefined);
+                      }
                     } catch (error) {
                       if (error instanceof Error && error.message.includes("Unsafe workspace archive symlink")) Object.assign(error, { code: "WORKSPACE_RESTORE_UNSAFE_ARCHIVE" });
                       throw error;
                     } finally { await input.client.remove(remoteRoot).catch(() => undefined); }
                   } finally { if (checkpointBaseline !== baselineSnapshot) await disposeDirectorySnapshot(checkpointBaseline); }
-                } else if (nativeSyncOut) {
+                }
+                if (input.workspaceCheckpoint && !checkpointSnapshot) await input.onWorkspaceCheckpoint?.({ mode: "full", scannedEntries: null, changedFiles: null, payloadBytes: null }).catch(() => undefined);
+                if (!checkpointSnapshot && nativeSyncOut) {
                   // Native outbound: the provider materializes the sandbox workspace into
                   // a fresh host directory. It is a clean destroy-then-replace into a
                   // temp dir the orchestrator just created, so it maps exactly to a
@@ -2078,7 +2125,7 @@ export async function prepareSandboxManagedRuntime(input: {
                   const syncResult = await withWorkspaceRestoreStep("workspace_transfer", () => input.client.syncOut!(operations));
                   const transferredBytes = sumSyncResultBytes(syncResult);
                   await workspaceRestore.finish(transferredBytes, transferredBytes);
-                } else {
+                } else if (!checkpointSnapshot) {
                   const remoteWorkspaceTar = path.posix.join(runtimeRootDir, "workspace-download.tar");
                   await withWorkspaceRestoreStep("workspace_transfer", () => input.client.run(
                     `sh -c ${shellQuote(createRemoteTarballFromDirectoryCommand({
@@ -2108,6 +2155,7 @@ export async function prepareSandboxManagedRuntime(input: {
                     });
                   });
                 }
+                if (!checkpointSnapshot) await confineFullWorkspaceExport(extractedDir);
                 const gitHeadToIntegrate = importedHead;
                 await withWorkspaceRestoreStep("directory_merge", async () => {
                   const mergeBaseline = repositories.length === 0 ? baselineSnapshot! : await selectDirectorySnapshot(baselineSnapshot!, {
