@@ -1293,10 +1293,28 @@ cleanup. Public-path characterization tests are in
 browser fixture also checks the persisted prompt variants and description revision
 from a real process adapter before completing its task.
 
+Execution configuration is assembled in
+`server/src/services/heartbeat/execution-configuration.ts`: workspace and issue
+overrides, scoped credentials, managed AI identity, and runtime skill delivery.
+The executor receives credential ownership and failure-redaction updates as soon
+as they are available, so later setup failures still clean up acquired resources.
+Busy-account deferral returns explicitly before session/workspace preparation.
+Public-path tests are in `server/src/__tests__/heartbeat-execution-configuration.test.ts`.
+
+Session preparation is in `server/src/services/heartbeat/session-preparation.ts`.
+It selects fresh or resumable sessions from effective config and managed-account
+identity, then resolves adapter session identity and compaction after workspace
+preparation. Both phases keep their original ordering in `heartbeat.ts`; they
+acquire no runtime resources. Public-path characterization tests live in
+`server/src/__tests__/heartbeat-session-preparation.test.ts`.
+
 Run-log formatting is in `server/src/services/heartbeat/run-log.ts`. It bounds
 stored event payloads, redacts and shortens log chunks, and caps stdout/stderr
-excerpts. `heartbeat.ts` keeps event writes, current-user redaction, and live
-event delivery. Existing public helpers remain available from `heartbeat.ts`.
+excerpts. `run-output.ts` owns per-attempt log handles, current-user redaction,
+output progress writes, live log delivery, and adapter event callbacks. The log
+store remains service-scoped. Completion reads live excerpt getters so output
+that arrives during finalization is retained. Existing public helpers and flush
+interval constants remain available from `heartbeat.ts`.
 
 Workspace preparation is in `server/src/services/heartbeat/workspaces.ts`. It
 owns managed checkout materialization, workspace validation and reuse, referenced

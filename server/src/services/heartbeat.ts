@@ -1,4 +1,7 @@
 import { nativeChatWorkspaceCwd } from "./native-runtime/native-chat-workspace.js";
+import { prepareHeartbeatExecutionConfiguration } from "./heartbeat/execution-configuration.js";
+import { createHeartbeatRunOutput } from "./heartbeat/run-output.js";
+import { prepareHeartbeatSession, resolveHeartbeatAdapterSession } from "./heartbeat/session-preparation.js";
 import { prepareHeartbeatTaskContext } from "./heartbeat/task-context.js";
 import { selectHeartbeatEnvironment } from "./heartbeat/environment-selection.js";
 import { prepareHeartbeatWorkspace } from "./heartbeat/workspace-preparation.js";
@@ -31,8 +34,6 @@ export {
 } from "./heartbeat/run-control.js";
 import {
   isHeartbeatRunTerminalStatus,
-  isHeartbeatRunRuntimeStatusActive,
-  publishHeartbeatRunRuntimeProgress,
   decorateHeartbeatRunRuntimeStatus,
   createHeartbeatLifecycle,
 } from "./heartbeat/run-lifecycle.js";
@@ -82,9 +83,6 @@ import {
   normalizeResumeParamsForAdapter,
   truncateDisplayId,
   resolveLedgerScopeForRun,
-  describeSessionResetReason,
-  isCanonicalSessionIdForAdapter,
-  requiresCanonicalSessionIds,
   resolveNextSessionState,
   resolveCacheAdjustedCostUsd,
   resolveLedgerCostStatus,
@@ -118,9 +116,6 @@ import {
   resolveAcceptedPlanWakeRoutingDecision,
   clearInteractionContinuationWakeContext,
   PAPERCLIP_WAKE_PAYLOAD_KEY,
-  resolveRunScopedMentionedSkillKeys,
-  resolveExecutionRunAdapterConfig,
-  applyRunScopedMentionedSkillKeys,
   MANAGED_GITHUB_TOKEN_KEYS,
   configuredPaperclipApiBaseUrl,
   createHeartbeatRunPreparation,
@@ -139,18 +134,10 @@ export {
   buildPaperclipWakePayload,
 } from "./heartbeat/run-preparation.js";
 import {
-  buildExecutionWorkspaceConfigSnapshot,
-  stripWorkspaceRuntimeFromExecutionRunConfig,
-  buildEffectiveRunSessionConfigMetadata,
-  readConfigFingerprintFromSessionParams,
-  readConfiguredModelFromAdapterConfig,
-  resolveTaskSessionConfigFreshness,
-  stripPaperclipSessionMetadataFromSessionParams,
   resolveRuntimeSessionParamsForWorkspace,
   buildRunWorkspaceHints,
   buildReferencedProjectRunObservability,
   assertGitSensitiveAdapterWorkspaceValid,
-  type EffectiveRunSessionConfigMetadata,
   createHeartbeatWorkspaceResolver,
 } from "./heartbeat/workspaces.js";
 export {
@@ -212,11 +199,7 @@ export {
   stripPaperclipSessionMetadataFromSessionParams,
   resolveTaskSessionConfigFreshness,
 } from "./heartbeat/workspaces.js";
-import {
-  appendExcerpt,
-  boundHeartbeatRunEventPayloadForStorage,
-  compactRunLogChunk,
-} from "./heartbeat/run-log.js";
+import { boundHeartbeatRunEventPayloadForStorage } from "./heartbeat/run-log.js";
 export {
   boundHeartbeatRunEventPayloadForStorage,
   compactRunLogChunk,
@@ -226,10 +209,7 @@ export { buildPaperclipTaskMarkdown } from "./heartbeat/task-markdown.js";
 import { decisionModelService } from "./decision-models.js";
 import { TASK_QUESTION_GUIDANCE } from "./issue-question-context.js";
 import { createAgentIdentityRedactor } from "./agent-identity-redaction.js";
-import { agentIdentityService, supportsManagedAgentIdentity } from "./agent-identity.js";
 
-import { prepareConnectionInstructionDelivery } from "./connection-instructions.js";
-import { resolveAssignedConnectionInstructionsForRun } from "./native-runtime/assigned-mcp-tools.js";
 
 import {
   startupCancellationFence,
@@ -265,19 +245,13 @@ import {
   watchLegacyControllerLease,
 } from "./legacy-controller-lease.js";
 
-import { applyConnectorSkills, prepareConnectorSkillDelivery, resolveConnectorAssignments } from "./connector-runtime.js";
 
-import { connectionIntentService } from "./connection-intents.js";
 import {
   prepareManagedAiRuntime,
   assertManagedAiProjectAuth,
-  stripAiAuthBindings,
-  isAiConnectionBusy,
-  AI_AUTH_ENV_KEYS,
 } from "./ai-connection-runtime.js";
 import { aiConnectionBindingSchema, aiRuntimeConnectionBindingSchema, type AiConnectionRouterSelection } from "@paperclipai/shared";
 import { aiConnectionRouterService, AiConnectionPoolExhausted, applyAiConnectionRouterTaskSettings } from "./ai-connection-router.js";
-import { aiConnectionSessionCompatibilityInputs, managedAiSessionIdentityCompatible } from "./ai-connection-session.js";
 import {
   getExecutionBlocker,
 } from "./execution-blocker.js";
@@ -321,7 +295,6 @@ import {
 } from "node:crypto";
 import {
   and,
-  desc,
   eq,
   exists,
   inArray,
@@ -338,7 +311,6 @@ import {
 } from "@paperclipai/shared";
 import {
   agents,
-  agentConfigRevisions,
   agentWakeupRequests,
   chatActions,
   heartbeatRuns,
@@ -353,7 +325,6 @@ import { HttpError, notFound } from "../errors.js";
 
 import { logger } from "../middleware/logger.js";
 import {
-  resolveManagedGitHubIdentitySelection,
   scrubGitCredentialText,
 } from "./git-credentials.js";
 // Re-exported because heartbeat's workspace surface exposed the scrubber before the
@@ -378,25 +349,16 @@ import {
 } from "./native-runtime/index.js";
 
 import {
-  recordFailedSkillPreparation,
-  type NativeRunHistoricalSpan,
-} from "./native-runtime/native-run-trace.js";
-import {
   parseNativeExecutionInput,
   type NativeExecutionInput,
   type NativeSessionBackend,
 } from "../vendor/paperclip-runner/index.js";
-import { createNativeSessionHandoffLoader } from "./native-runtime/native-session-handoff.js";
 
-import { getRunLogStore, type RunLogHandle } from "./run-log-store.js";
+import { getRunLogStore } from "./run-log-store.js";
 import {
   providerTraceStore,
 } from "./provider-trace-store.js";
 import { getServerAdapter, runningProcesses } from "../adapters/index.js";
-import type {
-  AdapterInvocationMeta,
-  AdapterRuntimeEvent,
-} from "../adapters/index.js";
 
 import { createRuntimeToolsToken } from "../runtime-tools-token.js";
 import {
@@ -418,7 +380,6 @@ import {
   emitAgentTaskRun,
   emitAgentTaskRunById,
 } from "./agent-task-run-telemetry.js";
-import { readAiConnectionConfigurationFailure, readAiCredentialAccessFailure } from "./ai-connection-configuration-failure.js";
 import { reportRunFailure } from "./run-failure-report.js";
 
 import { collectRunFailureSecretValues, type RunFailureReportOptions } from "./run-failure-diagnostics.js";
@@ -512,7 +473,6 @@ import {
   type PostCommitEffect,
   MAX_TURN_CONTINUATION_RETRY_REASON,
   WORKSPACE_BUSY_RETRY_REASON,
-  AI_CONNECTION_BUSY_RETRY_REASON,
   AI_CONNECTION_POOL_WAIT_RETRY_REASON,
   INTERACTION_CONTINUATION_INFRA_RETRY_REASON,
   INTERACTION_CONTINUATION_INFRA_WAKE_REASON,
@@ -536,15 +496,9 @@ import {
   DIRECT_NON_INVOKABLE_STATUSES,
 } from "./agent-invokability.js";
 
-import {
-  redactCurrentUserText,
-} from "../log-redaction.js";
 
 import { createRunSecretRedactionRegistry } from "./run-secret-redaction.js";
 
-import {
-  readPaperclipSkillSyncPreference,
-} from "@paperclipai/adapter-utils/server-utils";
 
 import { environmentService } from "./environments.js";
 
@@ -552,13 +506,11 @@ import {
   environmentRuntimeService,
   type ProviderResourceDisposition,
 } from "./environment-runtime.js";
-import { skillVersionSelectionMap } from "./runtime-skill-selections.js";
 import { environmentRunOrchestrator } from "./environment-run-orchestrator.js";
 
 import {
   clearHeartbeatRunRuntimeStatus,
   sweepExpiredHeartbeatRunRuntimeStatuses,
-  touchHeartbeatRunRuntimeStatus,
 } from "./heartbeat-run-runtime-status.js";
 
 import {
@@ -570,11 +522,6 @@ import { resolveAndRetainRunTrustPreset } from "./run-trust-preset.js";
 import type { PluginWorkerManager } from "./plugin-worker-manager.js";
 
 import { computeTaskDrain, applyTaskDrain, startTaskDrain, stopTaskDrain, readTaskDrain } from "./task-admission.js";
-
-const MAX_LIVE_LOG_CHUNK_BYTES = 8 * 1024;
-
-const ACCEPTED_PLAN_CONVERSION_SKILL_KEY =
-  "paperclipai/paperclip/paperclip-converting-plans-to-tasks";
 
 const execFile = promisify(execFileCallback);
 const UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES = [
@@ -588,8 +535,7 @@ export {
   ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS,
   ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS,
 } from "./recovery/service.js";
-export const ACTIVE_RUN_OUTPUT_PROGRESS_FLUSH_INTERVAL_MS = 60 * 1000;
-export const ACTIVE_RUN_LOG_RUNTIME_STATUS_REFRESH_INTERVAL_MS = 5 * 1000;
+export { ACTIVE_RUN_OUTPUT_PROGRESS_FLUSH_INTERVAL_MS, ACTIVE_RUN_LOG_RUNTIME_STATUS_REFRESH_INTERVAL_MS } from "./heartbeat/run-output.js";
 
 export {
   INTERACTION_CONTINUATION_INFRA_RETRY_REASON,
@@ -2761,318 +2707,46 @@ export function heartbeatService(
         services: { executionWorkspacesSvc, environmentsSvc, instanceSettings, findSharedWorkspaceHolder },
       });
       let nativeChatExpectedCwd = selectedNativeChatExpectedCwd;
-      const mergedConfig = {
-        ...sourceWorkspaceConfig,
-        // The base below is already task-owned. Keep directory transport while
-        // preserving isolated mode and the mandatory sandbox preflight.
-        ...((useIsolatedTaskDirectory || explicitTaskDirectory) ? { workspaceStrategy: { type: "project_primary" } } : {}),
-      };
-      const configSnapshot = buildExecutionWorkspaceConfigSnapshot(
-        mergedConfig,
-        selectedEnvironmentId,
-      );
-      const executionRunConfig =
-        stripWorkspaceRuntimeFromExecutionRunConfig(mergedConfig);
-      const runScopedMentionedSkillKeys =
-        await resolveRunScopedMentionedSkillKeys({
-          db,
-          companyId: agent.companyId,
-          issueId,
-          commentIds: extractWakeCommentIds(context),
-        });
-      const runScopedSkillKeys =
-        acceptedPlanContinuationWake &&
-        !acceptedPlanWakeRoutingDecision?.suppressAcceptedContinuation
-          ? [...runScopedMentionedSkillKeys, ACCEPTED_PLAN_CONVERSION_SKILL_KEY]
-          : runScopedMentionedSkillKeys;
-      const githubSelection = await resolveManagedGitHubIdentitySelection(
-        db,
-        agent.companyId,
-        {
-          agentId: agent.id,
-          responsibleUserId,
-          allowStandingDelegation: false,
-        },
-      );
-      const useHostGitHub =
-        !githubSelection.configured &&
-        trustPreset.kind === "standard" &&
-        ["local", "ssh"].includes(
-          selectedEnvironmentForConfig?.driver ?? "local",
-        );
-
-      const { resolvedConfig, configuredTaskEnvironment, secretKeys, secretManifest } =
-        await resolveExecutionRunAdapterConfig({
-          managedAiCredentials: Boolean(aiBinding),
-          managedGitHubCredentials: !useHostGitHub,
-          companyId: agent.companyId,
-          agentId: agent.id,
-          adapterType: agent.adapterType,
-          issueId,
-          heartbeatRunId: run.id,
-          environmentId: selectedEnvironmentForConfig?.id ?? null,
-          environmentEnv: aiBinding ? stripAiAuthBindings(selectedEnvironmentForConfig?.envVars) : selectedEnvironmentForConfig?.envVars ?? null,
-          environmentDriver: selectedEnvironmentForConfig?.driver ?? null,
-          projectId: taskProjectContext?.id ?? null,
-          routineId: routineEnvContext.routineId,
-          responsibleUserId,
-          executionRunConfig: aiBinding ? { ...executionRunConfig, env: stripAiAuthBindings(executionRunConfig.env) } : executionRunConfig,
-          projectEnv: aiBinding ? stripAiAuthBindings(taskProjectContext?.env) : taskProjectContext?.env ?? null,
-          routineEnv: aiBinding ? stripAiAuthBindings(routineEnvContext.env) : routineEnvContext.env,
-          secretsSvc,
-          trustPreset,
-        });
-      readFailureReportSecrets = () => collectRunFailureSecretValues(resolvedConfig.env, secretKeys);
-      if (aiBinding) {
-        try {
-          managedAiRuntime = await prepareManagedAiRuntime(db, { companyId: agent.companyId, agentId: agent.id, responsibleUserId, adapterType: agent.adapterType, binding: aiBinding, config: resolvedConfig });
-        } catch (error) {
-          // Only fresh executions can receive a pre-provider wait receipt. A
-          // persisted native input may already have provider effects to recover.
-          if (isAiConnectionBusy(error) && !persistedNativeExecutionInput) {
-            // Use the authority recorded by the locked admission gate, never
-            // the issue's mutable assignee observed during runtime preparation.
-            const authorizedNonAssigneeWake =
-              parseObject(run.runnerProfileJson).aiConnectionNonAssigneeCommentWake === true ||
-              (run.scheduledRetryReason === AI_CONNECTION_BUSY_RETRY_REASON &&
-                isNonAssigneeWorkspaceBusyRetry(run.scheduledRetryReason, parseObject(run.contextSnapshot)));
-            await finalizeAiConnectionBusyDeferral(run, error, !authorizedNonAssigneeWake);
-            return;
-          }
-          if (responsibleUserId && issueId) {
-            await connectionIntentService(db).request({ sub: agent.id, company_id: agent.companyId, run_id: run.id, responsible_user_id: responsibleUserId }, aiBinding.provider, { purpose: "ai" }).catch(() => {
-              logger.warn({ runId: run.id, agentId: agent.id }, "Could not attach AI connection request; runtime configuration action remains available");
-            });
-          }
-          throw new ConfigurationIncompleteFailure(error instanceof Error ? error.message : "Configure this agent’s AI connection", {
-            configurationIncomplete: { reason: "ai_connection_unavailable", companyId: agent.companyId, agentId: agent.id, responsibleUserId,
-              ...(!persistedNativeExecutionInput && readAiConnectionConfigurationFailure(error)
-                ? { selectionFailure: readAiConnectionConfigurationFailure(error) } : {}),
-              ...(readAiCredentialAccessFailure(error)
-                ? { credentialAccess: readAiCredentialAccessFailure(error) } : {}),
-              provider: aiBinding.provider, method: aiBinding.method, actionUrl: `/agents/${agent.id}/runtime`,
-              fingerprint: `ai:${agent.id}:${responsibleUserId}:${JSON.stringify(aiBinding)}` },
-          });
-        }
-        const savedAiAccount = parseObject(run.contextSnapshot?.aiConnection);
-        if (persistedNativeExecutionInput && !managedAiSessionIdentityCompatible(
-          savedAiAccount.sessionIdentity ?? savedAiAccount.identity,
-          managedAiRuntime.sessionIdentity,
-          managedAiRuntime.identity,
-        )) {
-          throw new ConfigurationIncompleteFailure("The AI account changed while this native run was suspended. Start a new execution.", { configurationIncomplete: { reason: "ai_connection_changed", actionUrl: `/agents/${agent.id}/runtime` } });
-        }
-        Object.assign(resolvedConfig, managedAiRuntime.config);
-        for (const key of AI_AUTH_ENV_KEYS) secretKeys.add(key);
-        context.aiConnection = { ...managedAiRuntime.attribution, accountName: managedAiRuntime.accountName, identity: managedAiRuntime.identity, sessionIdentity: managedAiRuntime.sessionIdentity };
-        await db.update(heartbeatRuns).set({ contextSnapshot: sql`coalesce(${heartbeatRuns.contextSnapshot}, '{}'::jsonb) || ${JSON.stringify({ aiConnection: context.aiConnection, ...(context.aiRouterTaskKey ? { aiRouterTaskKey: context.aiRouterTaskKey } : {}), ...(context.aiRouterSelection ? { aiRouterSelection: context.aiRouterSelection } : {}) })}::jsonb` }).where(eq(heartbeatRuns.id, run.id));
-      }
-      if (secretManifest.length > 0) {
-        context.paperclipSecrets = {
-          manifest: secretManifest,
-        };
-      } else {
-        delete context.paperclipSecrets;
-      }
-      const effectiveResolvedConfig = applyRunScopedMentionedSkillKeys(
-        resolvedConfig,
-        runScopedSkillKeys,
-      );
-      const runtimeSkillPreference = readPaperclipSkillSyncPreference(
-        effectiveResolvedConfig,
-      );
-      const nativeRunnerPreparationSpans: NativeRunHistoricalSpan[] = [];
-      const skillsPrepareStartedAtMs = Date.now();
-      const runtimeSkillEntries = await (async () => {
-        try {
-          return await companySkills.listRuntimeSkillEntries(agent.companyId, {
-            versionSelections: skillVersionSelectionMap(
-              runtimeSkillPreference.desiredSkillEntries,
-              {
-                versionPinsEnabled:
-                  resolvedInstanceSettings.experimental.enableBetaSkills ===
-                  true,
-              },
-            ),
-          });
-        } catch (error) {
-          if (agent.adapterType === "paperclip_runner") {
-            await recordFailedSkillPreparation({
-              runId: run.id,
-              startedAtMs: skillsPrepareStartedAtMs,
-              onEvent: async (event) => {
-                await appendRunEvent(run, event);
-              },
-            });
-          }
-          throw error;
-        }
-      })();
-      nativeRunnerPreparationSpans.push({
-        name: "skills.prepare",
-        parentName: "task.prepare",
-        startedAtMs: skillsPrepareStartedAtMs,
-        endedAtMs: Date.now(),
+      const executionConfiguration = await prepareHeartbeatExecutionConfiguration(db, {
+        run, agent,
+        task: { issueId, context, responsibleUserId, acceptedPlanContinuationWake, acceptedPlanWakeRoutingDecision, taskProjectContext, routineEnvContext },
+        config: { sourceWorkspaceConfig, aiBinding },
+        policy: { trustPreset, useIsolatedTaskDirectory, explicitTaskDirectory },
+        environment: { selectedEnvironmentId, selectedEnvironmentForConfig, resolvedInstanceSettings, persistedNativeExecutionInput },
+        services: { secretsSvc, companySkills, appendRunEvent, finalizeAiConnectionBusyDeferral },
+        onFailureSecretsResolved: (readSecrets) => { readFailureReportSecrets = readSecrets; },
+        onManagedAiRuntimeAcquired: (runtime) => { managedAiRuntime = runtime; },
+        onIdentityRedactorPrepared: (redactor) => { identityRedactor = redactor; },
       });
-      const connectorAssignments = await resolveConnectorAssignments(db, { companyId: agent.companyId, agentId: agent.id, runId: run.id, issueId: typeof context.issueId === "string" ? context.issueId : undefined });
-      const connectorSkillConfig = await applyConnectorSkills(effectiveResolvedConfig, runtimeSkillEntries, connectorAssignments);
-      // Both CLI adapters and native context materialization use the same resolved set.
-      runtimeSkillEntries.splice(0, runtimeSkillEntries.length, ...connectorSkillConfig.paperclipRuntimeSkills);
-      const connectorDelivery = await prepareConnectorSkillDelivery(connectorSkillConfig, agent.adapterType);
-      // Always replace this runtime-only field; caller wake data cannot supply skills.
-      context.paperclipWake = { ...parseObject(context.paperclipWake), connectorSkillInstructions: connectorDelivery.instructions };
-      let runtimeConfig = await prepareConnectionInstructionDelivery({
-        resolve: () => resolveAssignedConnectionInstructionsForRun(db, { companyId: agent.companyId, agentId: agent.id, runId: run.id }),
-        context, config: connectorDelivery.config, native: agent.adapterType === "paperclip_runner",
-      });
-      const agentIdentity = supportsManagedAgentIdentity(agent.adapterType, agent.adapterConfig, run.runtimeMode === "native" ? run.driverKind : undefined)
-        ? await agentIdentityService(db).ensureAgentIdentity(agent.companyId, agent.id)
-        : undefined;
-      identityRedactor = createAgentIdentityRedactor(agentIdentity?.privateKeyPem);
-      if (agentIdentity) secretKeys.add("PAPERCLIP_AGENT_PRIVATE_KEY");
+      if (!executionConfiguration.prepared) return;
+      const {
+        mergedConfig, configSnapshot, runScopedMentionedSkillKeys, githubSelection, useHostGitHub,
+        resolvedConfig, configuredTaskEnvironment, secretKeys, secretManifest,
+        runtimeSkillEntries, nativeRunnerPreparationSpans, agentIdentity,
+      } = executionConfiguration;
+      let { runtimeConfig } = executionConfiguration;
       const resolvedFailureSecrets = readFailureReportSecrets();
       readFailureReportSecrets = () => [
         ...resolvedFailureSecrets,
         ...identityRedactor.values,
         ...collectRunFailureSecretValues(runtimeConfig.env, secretKeys),
       ];
-      const latestAgentConfigRevision = await getLatestAgentConfigRevision(
-        agent.companyId,
-        agent.id,
-      );
-      const sessionConfigMetadataInput = {
-          agentIdentityKeyId: agentIdentity?.keyId,
-          adapterType: agent.adapterType,
-          effectiveAdapterConfig: runtimeConfig,
-          managedAiHome: managedAiRuntime?.home,
-          agentRuntimeConfig: agent.runtimeConfig,
-          issueOverrides: issueAssigneeOverrides,
-          workspaceConfig: {
-            requestedMode: requestedExecutionWorkspaceMode,
-            effectiveMode: effectiveExecutionWorkspaceMode,
-            issueConfigRevisionAt:
-              issueContext?.updatedAt instanceof Date
-                ? issueContext.updatedAt.toISOString()
-                : (issueContext?.updatedAt ?? null),
-            projectConfigRevisionAt:
-              workspaceProjectContext?.updatedAt instanceof Date
-                ? workspaceProjectContext.updatedAt.toISOString()
-                : (workspaceProjectContext?.updatedAt ?? null),
-            projectPolicy: projectExecutionWorkspacePolicy,
-            issueSettings: issueExecutionWorkspaceSettings,
-            reusableExecutionWorkspaceConfig:
-              requestedReusableExecutionWorkspaceConfig,
-            existingExecutionWorkspace: reusableExistingExecutionWorkspace
-              ? {
-                  id: reusableExistingExecutionWorkspace.id,
-                  mode: reusableExistingExecutionWorkspace.mode,
-                  strategyType: reusableExistingExecutionWorkspace.strategyType,
-                  projectWorkspaceId:
-                    reusableExistingExecutionWorkspace.projectWorkspaceId,
-                  repoUrl: reusableExistingExecutionWorkspace.repoUrl,
-                  baseRef: reusableExistingExecutionWorkspace.baseRef,
-                  branchName: reusableExistingExecutionWorkspace.branchName,
-                  config: reusableExistingExecutionWorkspace.config,
-                }
-              : null,
-          },
-          environment: {
-            selectionSource: environmentResolution.source,
-            selectedEnvironmentId,
-            selectedEnvironment: selectedEnvironmentForConfig
-              ? {
-                  id: selectedEnvironmentForConfig.id,
-                  driver: selectedEnvironmentForConfig.driver,
-                  config: selectedEnvironmentForConfig.config,
-                  configRevisionAt:
-                    selectedEnvironmentForConfig.updatedAt instanceof Date
-                      ? selectedEnvironmentForConfig.updatedAt.toISOString()
-                      : (selectedEnvironmentForConfig.updatedAt ?? null),
-                }
-              : null,
-            executionPolicy,
-          },
-          environmentEnv: selectedEnvironmentForConfig?.envVars ?? null,
-          projectEnv: taskProjectContext?.env ?? null,
-          routineEnv: routineEnvContext.env,
-          secretManifest,
-          runtimeSkills: runtimeSkillEntries,
-          agentConfigRevision: latestAgentConfigRevision
-            ? {
-                id: latestAgentConfigRevision.id,
-                changedKeys: latestAgentConfigRevision.changedKeys,
-                configRevisionAt:
-                  latestAgentConfigRevision.createdAt.toISOString(),
-              }
-            : null,
-        };
-      const sessionConfigMetadata = await buildEffectiveRunSessionConfigMetadata(sessionConfigMetadataInput);
-      let compatibleConfigMetadata: EffectiveRunSessionConfigMetadata[] = [];
-      if (managedAiRuntime && aiBinding && taskSession &&
-        readConfigFingerprintFromSessionParams(taskSession.sessionParamsJson)?.fingerprint !== sessionConfigMetadata.fingerprint) {
-        const revisions = requestedAiBinding?.mode === "router"
-          ? await db.select().from(agentConfigRevisions).where(and(eq(agentConfigRevisions.companyId, agent.companyId), eq(agentConfigRevisions.agentId, agent.id))).orderBy(desc(agentConfigRevisions.createdAt), desc(agentConfigRevisions.id)).limit(21)
-          : [];
-        const candidates = aiConnectionSessionCompatibilityInputs({
-          effectiveAdapterConfig: runtimeConfig, agentRuntimeConfig: agent.runtimeConfig,
-          agentConfigRevision: sessionConfigMetadataInput.agentConfigRevision,
-          issueOverrides: issueAssigneeOverrides, originalIssueOverrides: originalAiIssueOverrides,
-          binding: aiBinding, router: requestedAiBinding?.mode === "router",
-          storedIdentity: taskSession.sessionParamsJson?.paperclipAiCredentialIdentity,
-          sessionIdentity: managedAiRuntime.sessionIdentity, credentialIdentity: managedAiRuntime.identity, revisions,
-        });
-        compatibleConfigMetadata = await Promise.all(candidates.map(candidate => buildEffectiveRunSessionConfigMetadata({ ...sessionConfigMetadataInput, ...candidate })));
-      }
-      const configuredModel =
-        readConfiguredModelFromAdapterConfig(runtimeConfig);
-      if (context.refreshTools === true && agent.adapterType !== "paperclip_runner") {
-        const capability = getServerAdapter(agent.adapterType).supportsToolRefreshOnResume;
-        const canRefresh = typeof capability === "function" ? capability(runtimeConfig) : capability === true;
-        if (!canRefresh) context.forceFreshSession = true;
-      }
-      const wakeSessionResetReason = describeSessionResetReason(context);
-      const sessionConfigFreshness = resolveTaskSessionConfigFreshness({
-        hasTaskSession: taskSession != null,
-        configuredModel,
-        taskSessionParams:
-          taskSession?.sessionParamsJson ?? taskSessionDecodedParams,
-        configMetadata: sessionConfigMetadata,
-        compatibleConfigMetadata,
-        wakeResetReason: wakeSessionResetReason,
-        preserveLegacySessionWithoutConfigMetadata:
-          acceptedPlanContinuationWake && !acceptedPlanWakeRoutingDecision && !agentIdentity,
+      const preparedSession = await prepareHeartbeatSession(db, {
+        run, agent,
+        task: { context, issueRef, issueContext, taskProjectContext, workspaceProjectContext, wakeCommentId, acceptedPlanContinuationWake, acceptedPlanWakeRoutingDecision },
+        session: { taskSession, taskSessionDecodedParams, explicitResumeSessionParams, explicitResumeSessionDisplayId, sessionCodec },
+        config: {
+          runtimeConfig, agentIdentity, issueAssigneeOverrides, originalAiIssueOverrides,
+          managedAiRuntime, aiBinding, requestedAiBinding, secretManifest, runtimeSkillEntries, routineEnvContext,
+        },
+        workspace: {
+          requestedExecutionWorkspaceMode, effectiveExecutionWorkspaceMode, projectExecutionWorkspacePolicy,
+          issueExecutionWorkspaceSettings, executionPolicy, requestedReusableExecutionWorkspaceConfig, reusableExistingExecutionWorkspace,
+        },
+        environment: { environmentResolution, selectedEnvironmentId, selectedEnvironmentForConfig },
+        getLatestAgentConfigRevision,
       });
-      const resetTaskSession =
-        context.workspaceSelectionChanged === true || shouldResetTaskSessionForWake(context) || sessionConfigFreshness.reset;
-      const sessionResetReason =
-        sessionConfigFreshness.reasons.join("; ") || null;
-      const taskSessionForRun = resetTaskSession ? null : taskSession;
-      const getFreshSessionHandoff = issueRef ? createNativeSessionHandoffLoader({
-        db, companyId: agent.companyId, issueId: issueRef.id, agentId: agent.id, before: run.createdAt,
-        throughCommentId: readNonEmptyString(context.conversationReplayThroughCommentId) ?? (context.interactionKind ? null : wakeCommentId),
-      }) : undefined;
-      const previousSessionParams =
-        explicitResumeSessionParams ??
-        (isCanonicalSessionIdForAdapter(
-          agent.adapterType,
-          explicitResumeSessionDisplayId,
-        )
-          ? { sessionId: explicitResumeSessionDisplayId }
-          : null) ??
-        normalizeResumeParamsForAdapter(
-          agent.adapterType,
-          stripPaperclipSessionMetadataFromSessionParams(
-            sessionCodec.deserialize(
-              taskSessionForRun?.sessionParamsJson ?? null,
-            ),
-          ),
-        );
-      // Legacy plugins can consume the existing context field on a known-fresh
-      // dispatch. Built-ins also load lazily if their resume attempt fails.
-      if (agent.adapterType !== "paperclip_runner" && !previousSessionParams && getFreshSessionHandoff) {
-        const handoff = await getFreshSessionHandoff();
-        if (handoff) context.paperclipFreshSessionHandoffMarkdown = handoff;
-      }
+      const { sessionConfigMetadata, configuredModel, resetTaskSession, sessionResetReason, taskSessionForRun, getFreshSessionHandoff, previousSessionParams } = preparedSession;
       const {
         resolvedWorkspace,
         hostExecutionWorkspaceConfig,
@@ -3529,179 +3203,29 @@ export function heartbeatService(
       ) {
         context.projectId = executionWorkspace.projectId;
       }
-      const runtimeSessionFallback =
-        taskKey || resetTaskSession
-          ? null
-          : isCanonicalSessionIdForAdapter(agent.adapterType, runtime.sessionId)
-            ? runtime.sessionId
-            : null;
-      const runtimeSessionDisplayId = truncateDisplayId(
-        explicitResumeSessionDisplayId ??
-          taskSessionForRun?.sessionDisplayId ??
-          (sessionCodec.getDisplayId
-            ? sessionCodec.getDisplayId(runtimeSessionParams)
-            : null) ??
-          readNonEmptyString(runtimeSessionParams?.sessionId) ??
-          runtimeSessionFallback,
-      );
-      let previousSessionDisplayId = requiresCanonicalSessionIds(
-        agent.adapterType,
-      )
-        ? truncateDisplayId(
-            readNonEmptyString(previousSessionParams?.sessionId) ??
-              (isCanonicalSessionIdForAdapter(
-                agent.adapterType,
-                runtimeSessionDisplayId,
-              )
-                ? runtimeSessionDisplayId
-                : null) ??
-              runtimeSessionFallback,
-          )
-        : runtimeSessionDisplayId;
-      let runtimeSessionIdForAdapter =
-        readNonEmptyString(runtimeSessionParams?.sessionId) ??
-        runtimeSessionFallback;
-      let runtimeSessionParamsForAdapter = normalizeSessionParams(
-        stripPaperclipSessionMetadataFromSessionParams(runtimeSessionParams),
-      );
-
-      const sessionCompaction = await evaluateSessionCompaction({
+      const {
+        previousSessionDisplayId, runtimeSessionParamsForAdapter, taskSessionCredentialCompatible, runtimeForAdapter, configFreshnessResultMetadata, sessionCompaction,
+      } = await resolveHeartbeatAdapterSession({
         agent,
-        sessionId: previousSessionDisplayId ?? runtimeSessionIdForAdapter,
-        issueId,
-        continuationSummaryBody: continuationSummary?.body ?? null,
-      });
-      if (sessionCompaction.rotate) {
-        context.paperclipSessionHandoffMarkdown =
-          sessionCompaction.handoffMarkdown;
-        context.paperclipSessionRotationReason = sessionCompaction.reason;
-        context.paperclipPreviousSessionId =
-          previousSessionDisplayId ?? runtimeSessionIdForAdapter;
-        runtimeSessionIdForAdapter = null;
-        runtimeSessionParamsForAdapter = null;
-        previousSessionDisplayId = null;
-        if (sessionCompaction.reason) {
-          runtimeWorkspaceWarnings.push(
-            `Starting a fresh session because ${sessionCompaction.reason}.`,
-          );
-        }
-      } else {
-        delete context.paperclipSessionHandoffMarkdown;
-        delete context.paperclipSessionRotationReason;
-        delete context.paperclipPreviousSessionId;
-      }
-
-      const taskSessionCredentialCompatible = !managedAiRuntime || managedAiSessionIdentityCompatible(
-        taskSession?.sessionParamsJson?.paperclipAiCredentialIdentity,
-        managedAiRuntime.sessionIdentity,
-        managedAiRuntime.identity,
-      );
-      if (managedAiRuntime) {
-        sessionConfigMetadata.aiCredentialIdentity = managedAiRuntime.sessionIdentity;
-        if (!taskSessionCredentialCompatible) {
-          runtimeSessionIdForAdapter = null;
-          runtimeSessionParamsForAdapter = null;
-          previousSessionDisplayId = null;
-          delete executionContinuation?.resumeDelta;
-        }
-      }
-      const runtimeForAdapter = {
-        sessionId: runtimeSessionIdForAdapter,
-        sessionParams: runtimeSessionParamsForAdapter,
-        sessionDisplayId: previousSessionDisplayId,
-        taskKey,
-      };
-      // A delta is safe only when the selected provider session is exactly the
-      // task session whose last dispatch supplied the baseline history.
-      if (
-        executionContinuation?.resumeDelta &&
-        (!taskSessionForRun ||
-          !taskSession?.sessionDisplayId ||
-          runtimeForAdapter.sessionDisplayId !== taskSession.sessionDisplayId ||
-          resetTaskSession ||
-          context.forceFreshSession === true)
-      ) {
-        delete executionContinuation.resumeDelta;
-      }
-      const configFreshnessResultMetadata = {
-        version: sessionConfigMetadata.version,
-        session: {
-          fingerprintVersion: sessionConfigMetadata.version,
-          categories: sessionConfigMetadata.categories,
-          reset: resetTaskSession,
-          resetReasons: sessionConfigFreshness.reasons,
-          changedCategories: sessionConfigFreshness.changedCategories,
-          taskSessionAvailable: taskSession != null,
-          taskSessionReused: taskSessionForRun != null,
-          storedFingerprintPresent: Boolean(
-            sessionConfigFreshness.storedFingerprint,
-          ),
-          nextFingerprint: sessionConfigFreshness.nextFingerprint,
-        },
+        task: { context, taskKey, issueId, continuationSummary, executionContinuation },
+        session: { runtime, taskSession, sessionCodec, explicitResumeSessionDisplayId, runtimeSessionParams, managedAiRuntime, prepared: preparedSession },
         workspace: {
-          fingerprintVersion: latestWorkspaceConfigMetadata.version,
-          categories: latestWorkspaceConfigMetadata.categories,
-          action: workspaceConfigFreshness.action,
-          changedCategories: workspaceConfigFreshness.changedCategories,
-          reasons: workspaceConfigFreshness.reasons,
-          reuseRequested: requestedShouldReuseExisting,
-          workspaceReused: Boolean(reusedExecutionWorkspace),
-          configSnapshotRefreshed:
-            resolvedWorkspaceReusePolicy.shouldRefreshWorkspaceConfigSnapshot,
-          storedFingerprintPresent:
-            workspaceConfigFreshness.storedFingerprintPresent,
-          storedFingerprint: workspaceConfigFreshness.storedFingerprint,
-          inferredFingerprint: workspaceConfigFreshness.inferredFingerprint,
-          nextFingerprint: workspaceConfigFreshness.nextFingerprint,
-          previousWorkspaceId:
-            workspaceReuseRequest.requestedExecutionWorkspaceId,
-          activeWorkspaceId: persistedExecutionWorkspace?.id ?? null,
+          latestWorkspaceConfigMetadata, workspaceConfigFreshness, reusedExecutionWorkspace, resolvedWorkspaceReusePolicy,
+          persistedExecutionWorkspace, runtimeWorkspaceWarnings, requestedShouldReuseExisting, workspaceReuseRequest,
         },
-      };
+        evaluateSessionCompaction,
+      });
 
-      let handle: RunLogHandle | null = null;
+      const runOutput = createHeartbeatRunOutput(db, {
+        run, runId, issueId, runLogStore, identityRedactor, secretKeys,
+        appendRunEvent, getCurrentUserRedactionOptions,
+      });
       const goalCheckpointSession: {
         current: {
           params: Record<string, unknown>;
           displayId: string;
         } | null;
       } = { current: null };
-      let stdoutExcerpt = "";
-      let stderrExcerpt = "";
-      let outputSeq = Number(run.lastOutputSeq ?? 0);
-      let lastOutputFlushAt: Date | null = run.lastOutputAt ?? null;
-      let lastLogRuntimeStatusTouchMs = 0;
-      const outputProgressState: {
-        pending: {
-          at: Date;
-          seq: number;
-          stream: "stdout" | "stderr";
-          bytes: number;
-        } | null;
-      } = { pending: null };
-      let persistedLogBytes = Number(run.logBytes ?? 0);
-      const flushOutputProgress = async (opts?: { force?: boolean }) => {
-        const pendingOutputProgress = outputProgressState.pending;
-        if (!pendingOutputProgress) return;
-        const shouldFlush =
-          opts?.force === true ||
-          !lastOutputFlushAt ||
-          pendingOutputProgress.at.getTime() - lastOutputFlushAt.getTime() >=
-            ACTIVE_RUN_OUTPUT_PROGRESS_FLUSH_INTERVAL_MS;
-        if (!shouldFlush) return;
-        await db
-          .update(heartbeatRuns)
-          .set({
-            lastOutputAt: pendingOutputProgress.at,
-            lastOutputSeq: pendingOutputProgress.seq,
-            lastOutputStream: pendingOutputProgress.stream,
-            lastOutputBytes: pendingOutputProgress.bytes,
-            updatedAt: new Date(),
-          })
-          .where(eq(heartbeatRuns.id, run.id));
-        lastOutputFlushAt = pendingOutputProgress.at;
-        outputProgressState.pending = null;
-      };
       try {
         const startedAt = run.startedAt ?? new Date();
         const runningWithSession = await db
@@ -3780,100 +3304,8 @@ export function heartbeatService(
           message: "run started",
         });
 
-        handle = await runLogStore.begin({
-          companyId: run.companyId,
-          agentId: run.agentId,
-          runId,
-        });
-
-        await db
-          .update(heartbeatRuns)
-          .set({
-            logStore: handle.store,
-            logRef: handle.logRef,
-            updatedAt: new Date(),
-          })
-          .where(eq(heartbeatRuns.id, runId));
-
-        const currentUserRedactionOptions =
-          await getCurrentUserRedactionOptions();
-        const appendIdentityRedactedLog = async (stream: "stdout" | "stderr", chunk: string) => {
-          const sanitizedChunk = compactRunLogChunk(
-            redactCurrentUserText(chunk, currentUserRedactionOptions),
-          );
-          if (stream === "stdout")
-            stdoutExcerpt = appendExcerpt(stdoutExcerpt, sanitizedChunk);
-          if (stream === "stderr")
-            stderrExcerpt = appendExcerpt(stderrExcerpt, sanitizedChunk);
-          const ts = new Date().toISOString();
-
-          outputSeq += 1;
-          const chunkSeq = outputSeq;
-          let appendedBytes = 0;
-          if (handle) {
-            appendedBytes = await runLogStore.append(handle, {
-              stream,
-              chunk: sanitizedChunk,
-              ts,
-              seq: chunkSeq,
-            });
-            persistedLogBytes += appendedBytes;
-          }
-          outputProgressState.pending = {
-            at: new Date(ts),
-            seq: chunkSeq,
-            stream,
-            bytes: persistedLogBytes,
-          };
-          await flushOutputProgress();
-
-          // Streamed CLI output is real run activity: keep the in-memory
-          // runtime status ("Working... / X ago") fresh between structured
-          // events so sandbox runs with mid-run log streaming never show a
-          // minutes-stale timestamp. Throttled to avoid churning the live
-          // event stream on every 250ms tail chunk.
-          const logActivityAt = new Date(ts);
-          if (
-            isHeartbeatRunRuntimeStatusActive(run.status) &&
-            logActivityAt.getTime() - lastLogRuntimeStatusTouchMs >=
-              ACTIVE_RUN_LOG_RUNTIME_STATUS_REFRESH_INTERVAL_MS
-          ) {
-            lastLogRuntimeStatusTouchMs = logActivityAt.getTime();
-            const touchedStatus = touchHeartbeatRunRuntimeStatus({
-              companyId: run.companyId,
-              issueId,
-              agentId: run.agentId,
-              runId: run.id,
-              at: logActivityAt,
-            });
-            if (touchedStatus)
-              publishHeartbeatRunRuntimeProgress(touchedStatus);
-          }
-
-          const payloadChunk =
-            sanitizedChunk.length > MAX_LIVE_LOG_CHUNK_BYTES
-              ? sanitizedChunk.slice(
-                  sanitizedChunk.length - MAX_LIVE_LOG_CHUNK_BYTES,
-                )
-              : sanitizedChunk;
-
-          publishLiveEvent({
-            companyId: run.companyId,
-            type: "heartbeat.run.log",
-            payload: {
-              runId: run.id,
-              agentId: run.agentId,
-              issueId,
-              ts,
-              seq: chunkSeq,
-              stream,
-              chunk: payloadChunk,
-              truncated: payloadChunk.length !== sanitizedChunk.length,
-            },
-          });
-        };
-        const onLog = (stream: "stdout" | "stderr", chunk: string) =>
-          appendIdentityRedactedLog(stream, identityRedactor.chunk(stream, chunk));
+        const { currentUserRedactionOptions, appendIdentityRedactedLog, onLog, onAdapterMeta, onAdapterEvent } =
+          await runOutput.begin(currentRun);
         if (runScopedMentionedSkillKeys.length > 0) {
           await onLog(
             "stdout",
@@ -3961,36 +3393,6 @@ export function heartbeatService(
             );
           }
         }
-        const onAdapterMeta = async (meta: AdapterInvocationMeta) => {
-          meta = identityRedactor.redact(meta);
-          if (meta.env && secretKeys.size > 0) {
-            for (const key of secretKeys) {
-              if (key in meta.env) meta.env[key] = "***REDACTED***";
-            }
-          }
-          await appendRunEvent(currentRun, {
-            eventType: "adapter.invoke",
-            stream: "system",
-            level: "info",
-            message: "adapter invocation",
-            payload: meta as unknown as Record<string, unknown>,
-          });
-        };
-
-        const onAdapterEvent = async (event: AdapterRuntimeEvent) => {
-          event = identityRedactor.redact(event);
-          const eventType = event.eventType.trim();
-          if (!eventType) return;
-          await appendRunEvent(currentRun, {
-            eventType: eventType.slice(0, 120),
-            stream: event.stream,
-            level: event.level,
-            color: event.color,
-            message: event.message,
-            payload: event.payload,
-          });
-        };
-
         const adapter = getServerAdapter(agent.adapterType);
         const durableGoalControlRun =
           readNonEmptyString(context.goalControlRequestId) !== null ||
@@ -4389,11 +3791,7 @@ export function heartbeatService(
         }
         await runCompletion.completeRun({
           run, agent, issueId, issueRef, signal: executionControl.controller.signal,
-          output: {
-            handle, outputProgressState, flushOutputProgress,
-            get stdoutExcerpt() { return stdoutExcerpt; },
-            get stderrExcerpt() { return stderrExcerpt; },
-          },
+          output: runOutput,
           session: { runtimeForAdapter, previousSessionParams, taskKey, configuredModel, sessionConfigMetadata },
           readFailureReportSecrets,
           adapterResult, sessionCodec, taskSessionForRun, sessionCompaction,
@@ -4524,11 +3922,7 @@ export function heartbeatService(
         }
         await runCompletion.failRun({
           run, agent, issueId, issueRef, signal: executionControl.controller.signal,
-          output: {
-            handle, outputProgressState, flushOutputProgress,
-            get stdoutExcerpt() { return stdoutExcerpt; },
-            get stderrExcerpt() { return stderrExcerpt; },
-          },
+          output: runOutput,
           session: { runtimeForAdapter, previousSessionParams, taskKey, configuredModel, sessionConfigMetadata },
           readFailureReportSecrets,
           runId, err, identityRedactor, requiredWorkspaceRestoreEvidence, legacyAdapterEntered,
