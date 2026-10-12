@@ -1,1 +1,4 @@
-export { parseHermesGatewayStdoutLine as parseStdoutLine } from "./parse-stdout.js";
+export {
+  parseHermesGatewayStdoutLine as parseStdoutLine,
+  createHermesGatewayStdoutParser as createStdoutParser,
+} from "./parse-stdout.js";
